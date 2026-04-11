@@ -1,0 +1,318 @@
+name: Gateway Benchmark Platform
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway:
+        description: "Gateway folder name (envoy | ngf | cilium)"
+        required: true
+        default: "envoy"
+      version:
+        description: "Gateway version tag (example: v1.5.4, v2.4.2, v1.17.2)"
+        required: true
+        default: "v1.5.4"
+
+jobs:
+  validate-input:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate input files exist
+        run: |
+          set -euo pipefail
+          GATEWAY="${{ github.event.inputs.gateway }}"
+          test -d "scripts/deploy/${GATEWAY}"
+          test -f "scripts/deploy/${GATEWAY}/metadata.env"
+          test -f "scripts/deploy/${GATEWAY}/install.sh"
+          test -f "scripts/deploy/${GATEWAY}/gateway.yaml"
+          test -f "scripts/deploy/common/cleanup_gateway.sh"
+          test -f "scripts/report/generate_dashboard.py"
+
+  detect-deploy-validate:
+    needs: validate-input
+    runs-on: ubuntu-latest
+    outputs:
+      deployed_gateway: ${{ steps.set_outputs.outputs.deployed_gateway }}
+      deployed_version: ${{ steps.set_outputs.outputs.deployed_version }}
+      node_ip: ${{ steps.set_outputs.outputs.node_ip }}
+      http_port: ${{ steps.set_outputs.outputs.http_port }}
+      https_port: ${{ steps.set_outputs.outputs.https_port }}
+      host_header: ${{ steps.set_outputs.outputs.host_header }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy deployment files to master
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.MASTER_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "scripts"
+          target: "/tmp/gateway-benchmark"
+
+      - name: Detect, cleanup conflicting gateway, deploy, validate
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.MASTER_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            REQUESTED_GATEWAY="${{ github.event.inputs.gateway }}"
+            REQUESTED_VERSION="${{ github.event.inputs.version }}"
+            REMOTE_BASE="/tmp/gateway-benchmark/scripts/deploy/${REQUESTED_GATEWAY}"
+            COMMON_BASE="/tmp/gateway-benchmark/scripts/deploy/common"
+
+            chmod +x "${COMMON_BASE}/cleanup_gateway.sh"
+            chmod +x "${REMOTE_BASE}/install.sh"
+            . "${REMOTE_BASE}/metadata.env"
+
+            echo "Requested gateway: ${REQUESTED_GATEWAY}"
+            echo "Requested version: ${REQUESTED_VERSION}"
+
+            echo "=== Cluster node health ==="
+            kubectl get nodes -o wide
+            NOT_READY_COUNT="$(kubectl get nodes --no-headers | awk '$2 != "Ready" {count++} END {print count+0}')"
+            if [ "${NOT_READY_COUNT}" -ne 0 ]; then
+              echo "One or more nodes are not Ready"
+              exit 1
+            fi
+
+            echo "=== Detect installed gateway type/version ==="
+            INSTALLED_GATEWAY="none"
+            INSTALLED_VERSION="none"
+
+            detect_version() {
+              local ns="$1"
+              local kind="$2"
+              local name="$3"
+              kubectl -n "${ns}" get "${kind}" "${name}" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null | awk -F: '{print $NF}'
+            }
+
+            if kubectl -n envoy-gateway-system get deployment envoy-gateway >/dev/null 2>&1; then
+              INSTALLED_GATEWAY="envoy"
+              INSTALLED_VERSION="$(detect_version envoy-gateway-system deployment envoy-gateway)"
+            elif kubectl -n nginx-gateway get deployment nginx-gateway >/dev/null 2>&1; then
+              INSTALLED_GATEWAY="ngf"
+              INSTALLED_VERSION="$(detect_version nginx-gateway deployment nginx-gateway)"
+            elif kubectl -n kube-system get daemonset cilium >/dev/null 2>&1; then
+              INSTALLED_GATEWAY="cilium"
+              INSTALLED_VERSION="$(detect_version kube-system daemonset cilium)"
+            fi
+
+            echo "Installed gateway: ${INSTALLED_GATEWAY}"
+            echo "Installed version: ${INSTALLED_VERSION}"
+
+            if [ "${INSTALLED_GATEWAY}" = "${REQUESTED_GATEWAY}" ] && [ "${INSTALLED_VERSION}" = "${REQUESTED_VERSION}" ]; then
+              echo "Same gateway and version already installed. Skipping deployment."
+            else
+              if [ "${INSTALLED_GATEWAY}" != "none" ] && [ "${INSTALLED_GATEWAY}" != "${REQUESTED_GATEWAY}" ]; then
+                echo "Conflicting gateway detected: ${INSTALLED_GATEWAY}. Cleaning it first."
+                "${COMMON_BASE}/cleanup_gateway.sh" "${INSTALLED_GATEWAY}"
+              fi
+
+              echo "Cleaning generic Gateway API resources"
+              kubectl delete httproute --all -A --ignore-not-found || true
+              kubectl delete gateway --all -A --ignore-not-found || true
+              kubectl delete gatewayclass --all --ignore-not-found || true
+
+              echo "Deploying requested gateway"
+              "${REMOTE_BASE}/install.sh" "${REQUESTED_VERSION}"
+
+              echo "Applying manifest"
+              kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
+            fi
+
+            echo "=== Wait for controller/data plane readiness ==="
+            sleep 20
+
+            for i in $(seq 1 36); do
+              PROGRAMMED="$(kubectl get gateway -A -o jsonpath='{.items[0].status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+              if [ "${PROGRAMMED}" = "True" ]; then
+                echo "Gateway Programmed=True"
+                break
+              fi
+              echo "Waiting for Gateway Programmed=True (${i}/36)"
+              sleep 10
+            done
+
+            PROGRAMMED="$(kubectl get gateway -A -o jsonpath='{.items[0].status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+            if [ "${PROGRAMMED}" != "True" ]; then
+              echo "Gateway failed to reach Programmed=True"
+              kubectl get gateway -A -o yaml || true
+              exit 1
+            fi
+
+            echo "=== Check pod health ==="
+            kubectl get pods -A
+            BAD_PODS="$(kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed" {print}')"
+            if [ -n "${BAD_PODS}" ]; then
+              echo "Some pods are not healthy:"
+              echo "${BAD_PODS}"
+              exit 1
+            fi
+
+            echo "=== Discover service, node IP and NodePorts ==="
+            NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+
+            SERVICE_NAME="$(kubectl -n "${SERVICE_NAMESPACE}" get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "${SERVICE_NAME_REGEX}" | head -n1)"
+            if [ -z "${SERVICE_NAME}" ]; then
+              echo "Unable to find service in namespace ${SERVICE_NAMESPACE} matching ${SERVICE_NAME_REGEX}"
+              kubectl -n "${SERVICE_NAMESPACE}" get svc
+              exit 1
+            fi
+
+            CURRENT_TYPE="$(kubectl -n "${SERVICE_NAMESPACE}" get svc "${SERVICE_NAME}" -o jsonpath='{.spec.type}')"
+            if [ "${CURRENT_TYPE}" != "NodePort" ]; then
+              kubectl -n "${SERVICE_NAMESPACE}" patch svc "${SERVICE_NAME}" -p '{"spec":{"type":"NodePort"}}'
+            fi
+
+            HTTP_PORT="$(kubectl -n "${SERVICE_NAMESPACE}" get svc "${SERVICE_NAME}" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')"
+            HTTPS_PORT="$(kubectl -n "${SERVICE_NAMESPACE}" get svc "${SERVICE_NAME}" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')"
+
+            if [ -z "${HTTP_PORT}" ] || [ -z "${HTTPS_PORT}" ]; then
+              echo "Failed to detect HTTP/HTTPS NodePorts"
+              kubectl -n "${SERVICE_NAMESPACE}" get svc "${SERVICE_NAME}" -o yaml
+              exit 1
+            fi
+
+            echo "Node IP: ${NODE_IP}"
+            echo "HTTP NodePort: ${HTTP_PORT}"
+            echo "HTTPS NodePort: ${HTTPS_PORT}"
+
+            echo "=== Curl validation ==="
+            curl -vk -H "Host: ${HOST_HEADER}" "http://${NODE_IP}:${HTTP_PORT}/"
+            curl -vk -H "Host: ${HOST_HEADER}" "https://${NODE_IP}:${HTTPS_PORT}/"
+
+            cat > /tmp/gateway_benchmark_outputs.env <<EOF
+            DEPLOYED_GATEWAY=${REQUESTED_GATEWAY}
+            DEPLOYED_VERSION=${REQUESTED_VERSION}
+            NODE_IP=${NODE_IP}
+            HTTP_PORT=${HTTP_PORT}
+            HTTPS_PORT=${HTTPS_PORT}
+            HOST_HEADER=${HOST_HEADER}
+            EOF
+
+      - name: Read output file from master
+        id: read_outputs
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.MASTER_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script_stop: true
+          script: |
+            cat /tmp/gateway_benchmark_outputs.env
+
+      - name: Set workflow outputs
+        id: set_outputs
+        run: |
+          set -euo pipefail
+          cat <<'EOF' > outputs.env
+          ${{ steps.read_outputs.outputs.stdout }}
+          EOF
+          . ./outputs.env
+
+          echo "deployed_gateway=${DEPLOYED_GATEWAY}" >> "$GITHUB_OUTPUT"
+          echo "deployed_version=${DEPLOYED_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "node_ip=${NODE_IP}" >> "$GITHUB_OUTPUT"
+          echo "http_port=${HTTP_PORT}" >> "$GITHUB_OUTPUT"
+          echo "https_port=${HTTPS_PORT}" >> "$GITHUB_OUTPUT"
+          echo "host_header=${HOST_HEADER}" >> "$GITHUB_OUTPUT"
+
+  benchmark:
+    needs: detect-deploy-validate
+    runs-on: ubuntu-latest
+    env:
+      GATEWAY: ${{ needs.detect-deploy-validate.outputs.deployed_gateway }}
+      VERSION: ${{ needs.detect-deploy-validate.outputs.deployed_version }}
+      NODE_IP: ${{ needs.detect-deploy-validate.outputs.node_ip }}
+      HTTP_PORT: ${{ needs.detect-deploy-validate.outputs.http_port }}
+      HTTPS_PORT: ${{ needs.detect-deploy-validate.outputs.https_port }}
+      HOST_HEADER: ${{ needs.detect-deploy-validate.outputs.host_header }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy test scripts to traffic generator
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.TG_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "scripts/tests"
+          target: "/tmp/gateway-benchmark"
+
+      - name: Run k6 tests
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.TG_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script_stop: true
+          envs: GATEWAY,VERSION,NODE_IP,HTTP_PORT,HTTPS_PORT,HOST_HEADER
+          script: |
+            set -euo pipefail
+
+            mkdir -p /tmp/gateway-results/raw
+            cd /tmp/gateway-benchmark/scripts/tests
+
+            export TARGET_HOST="${HOST_HEADER}"
+            export TARGET_NODE_IP="${NODE_IP}"
+            export TARGET_HTTP_PORT="${HTTP_PORT}"
+            export TARGET_HTTPS_PORT="${HTTPS_PORT}"
+            export GATEWAY="${GATEWAY}"
+            export VERSION="${VERSION}"
+
+            echo $TARGET_NODE_IP
+            echo $TARGET_HTTP_PORT
+            echo $TARGET_HTTPS_PORT
+
+            k6 run m01-throughput.js --summary-export /tmp/gateway-results/raw/m01-throughput.json
+            k6 run m04-tls-handshake.js --summary-export /tmp/gateway-results/raw/m04-tls-handshake.json
+            k6 run m05-route-propagation.js --summary-export /tmp/gateway-results/raw/m05-route-propagation.json
+
+            cat > /tmp/gateway-results/raw/run-metadata.json <<EOF
+            {
+              "gateway": "${GATEWAY}",
+              "version": "${VERSION}",
+              "node_ip": "${NODE_IP}",
+              "http_port": "${HTTP_PORT}",
+              "https_port": "${HTTPS_PORT}",
+              "host_header": "${HOST_HEADER}"
+            }
+            EOF
+
+      - name: Download results
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.TG_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "/tmp/gateway-results/raw/*"
+          target: "./downloaded-results"
+
+      - name: Generate webpage
+        run: |
+          set -euo pipefail
+          python3 scripts/report/generate_dashboard.py \
+            --results-dir "./downloaded-results/tmp/gateway-results/raw" \
+            --output-dir "./public"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-benchmark-results
+          path: |
+            downloaded-results
+            public
+
+      - name: Publish to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
