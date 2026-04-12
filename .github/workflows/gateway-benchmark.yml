@@ -129,7 +129,7 @@ jobs:
 
               CURRENT_TYPE="$(kubectl -n "${SERVICE_NAMESPACE}" get svc "${SERVICE_NAME}" -o jsonpath='{.spec.type}' 2>/dev/null || true)"
               if [ "${CURRENT_TYPE}" != "NodePort" ]; then
-                kubectl -n "${SERVICE_NAMESPACE}" patch svc "${SERVICE_NAME}" -p '{"spec":{"type":"NodePort"}}'
+                kubectl -n "${SERVICE_NAMESPACE}" patch svc "${SERVICE_NAME}" -p '{"spec":{"type":"NodePort"}}' >/dev/null
               fi
 
               HTTP_PORT="$(kubectl -n "${SERVICE_NAMESPACE}" get svc "${SERVICE_NAME}" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}' 2>/dev/null || true)"
@@ -148,35 +148,27 @@ jobs:
             }
 
             wait_for_gateway_ready() {
-              echo "=== Wait for specific Gateway readiness ==="
-              echo "Checking gateway: ${GATEWAY_NAMESPACE}/${GATEWAY_NAME}"
-
-              GATEWAY_CHECK="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" --no-headers 2>/dev/null || true)"
-              if [ -z "${GATEWAY_CHECK}" ]; then
-                echo "Gateway ${GATEWAY_NAMESPACE}/${GATEWAY_NAME} does not exist"
-                kubectl get gateway -A || true
-                return 1
-              fi
-
-              sleep 10
-
+              echo "=== Wait for gateway readiness ==="
+              echo "HGATEWAY_NAMESPACE: ${GATEWAY_NAMESPACE}"
+              echo "HGATEWAY_NAME: ${GATEWAY_NAME}"
               for i in $(seq 1 12); do
+                EXISTS="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" --no-headers 2>/dev/null || true)"
                 ACCEPTED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)"
                 PROGRAMMED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
 
-                echo "Attempt ${i}: Accepted=${ACCEPTED:-<empty>} Programmed=${PROGRAMMED:-<empty>}"
+                echo "Attempt ${i}: Exists=${EXISTS:+yes} Accepted=${ACCEPTED:-<empty>} Programmed=${PROGRAMMED:-<empty>}"
 
-                if [ "${PROGRAMMED}" = "True" ]; then
-                  echo "Gateway Programmed=True"
+                if [ -n "${EXISTS}" ] && [ "${PROGRAMMED}" = "True" ]; then
                   return 0
                 fi
 
                 sleep 10
               done
 
-              kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o yaml || true
+              echo "Gateway did not become ready"
               kubectl get gateway -A || true
               kubectl get httproute -A || true
+              kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o yaml || true
               return 1
             }
 
@@ -185,45 +177,27 @@ jobs:
               HTTPS_OK="false"
 
               echo "=== Curl validation ==="
-              if curl -vk --fail-with-body -H "Host: ${HOST_HEADER}" "http://${NODE_IP}:${HTTP_PORT}/"; then
+              if curl -skf -H "Host: ${HOST_HEADER}" "http://${NODE_IP}:${HTTP_PORT}/" >/dev/null; then
                 HTTP_OK="true"
               fi
 
-              if curl -vk --fail-with-body -H "Host: ${HOST_HEADER}" "https://${NODE_IP}:${HTTPS_PORT}/"; then
+              if curl -skf -H "Host: ${HOST_HEADER}" "https://${NODE_IP}:${HTTPS_PORT}/" >/dev/null; then
                 HTTPS_OK="true"
               fi
 
               echo "HTTP_OK=${HTTP_OK}"
               echo "HTTPS_OK=${HTTPS_OK}"
 
-              if [ "${HTTP_OK}" = "true" ] && [ "${HTTPS_OK}" = "true" ]; then
-                return 0
-              fi
-              return 1
+              [ "${HTTP_OK}" = "true" ] && [ "${HTTPS_OK}" = "true" ]
             }
 
             if [ "${INSTALLED_GATEWAY}" = "${REQUESTED_GATEWAY}" ] && [ "${INSTALLED_VERSION}" = "${REQUESTED_VERSION}" ]; then
               echo "Same gateway and version already installed."
 
-              EXISTING_GATEWAY_OUTPUT="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" --no-headers 2>/dev/null || true)"
-
-              if [ -n "${EXISTING_GATEWAY_OUTPUT}" ]; then
-                echo "Gateway exists. Checking readiness, service and curl before any re-apply."
-
-                wait_for_gateway_ready
-                discover_service_and_ports
-
-                if curl_validate; then
-                  echo "Existing deployment is healthy. Proceeding without re-apply."
-                else
-                  echo "Curl failed on existing deployment. Re-applying manifest."
-                  kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
-                  wait_for_gateway_ready
-                  discover_service_and_ports
-                  curl_validate
-                fi
+              if discover_service_and_ports && curl_validate; then
+                echo "Existing deployment is reachable. Skipping re-apply."
               else
-                echo "Gateway object missing. Re-applying manifest."
+                echo "Existing deployment is not reachable. Re-applying manifest."
                 kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
                 wait_for_gateway_ready
                 discover_service_and_ports
