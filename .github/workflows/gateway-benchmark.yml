@@ -10,7 +10,7 @@ on:
       version:
         description: "Gateway version tag (example: v1.5.4, v2.4.2, v1.17.2)"
         required: true
-        default: "v1.5.4"
+        default: "v1.7.1"
 
 jobs:
   validate-input:
@@ -122,12 +122,9 @@ jobs:
             if [ "${INSTALLED_GATEWAY}" = "${REQUESTED_GATEWAY}" ] && [ "${INSTALLED_VERSION}" = "${REQUESTED_VERSION}" ]; then
               echo "Same gateway and version already installed."
 
-              GATEWAY_EXISTS="false"
-              if kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" >/dev/null 2>&1; then
-                GATEWAY_EXISTS="true"
-              fi
+              EXISTING_GATEWAY_OUTPUT="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" --no-headers 2>/dev/null || true)"
 
-              if [ "${GATEWAY_EXISTS}" = "true" ]; then
+              if [ -n "${EXISTING_GATEWAY_OUTPUT}" ]; then
                 echo "Gateway resource already exists. Skipping deployment."
               else
                 echo "Gateway resource missing. Re-applying manifest."
@@ -154,7 +151,8 @@ jobs:
             echo "=== Wait for specific Gateway readiness ==="
             echo "Checking gateway: ${GATEWAY_NAMESPACE}/${GATEWAY_NAME}"
 
-            if ! kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" >/dev/null 2>&1; then
+            GATEWAY_CHECK="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" --no-headers 2>/dev/null || true)"
+            if [ -z "${GATEWAY_CHECK}" ]; then
               echo "Gateway ${GATEWAY_NAMESPACE}/${GATEWAY_NAME} does not exist"
               kubectl get gateway -A || true
               exit 1
