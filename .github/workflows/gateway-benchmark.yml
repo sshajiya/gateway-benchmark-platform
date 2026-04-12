@@ -10,7 +10,7 @@ on:
       version:
         description: "Gateway version tag (example: v1.5.4, v2.4.2, v1.17.2)"
         required: true
-        default: "v1.7.1"
+        default: "v1.5.4"
 
 jobs:
   validate-input:
@@ -122,7 +122,12 @@ jobs:
             if [ "${INSTALLED_GATEWAY}" = "${REQUESTED_GATEWAY}" ] && [ "${INSTALLED_VERSION}" = "${REQUESTED_VERSION}" ]; then
               echo "Same gateway and version already installed."
 
+              GATEWAY_EXISTS="false"
               if kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" >/dev/null 2>&1; then
+                GATEWAY_EXISTS="true"
+              fi
+
+              if [ "${GATEWAY_EXISTS}" = "true" ]; then
                 echo "Gateway resource already exists. Skipping deployment."
               else
                 echo "Gateway resource missing. Re-applying manifest."
