@@ -10,7 +10,7 @@ on:
       version:
         description: "Gateway version tag (example: v1.5.4, v2.4.2, v1.17.2)"
         required: true
-        default: "v1.5.4"
+        default: "v1.7.1"
 
 jobs:
   validate-input:
