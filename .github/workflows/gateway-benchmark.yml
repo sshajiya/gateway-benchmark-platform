@@ -125,9 +125,9 @@ jobs:
               EXISTING_GATEWAY_OUTPUT="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" --no-headers 2>/dev/null || true)"
 
               if [ -n "${EXISTING_GATEWAY_OUTPUT}" ]; then
-                echo "Gateway resource already exists. Skipping deployment."
+                echo "Gateway object exists. Will validate service and curl before deciding to re-apply."
               else
-                echo "Gateway resource missing. Re-applying manifest."
+                echo "Gateway object does not exist. Re-applying manifest."
                 kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
               fi
             else
@@ -183,15 +183,6 @@ jobs:
               exit 1
             fi
 
-            echo "=== Check pod health ==="
-            kubectl get pods -A
-            BAD_PODS="$(kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed" {print}')"
-            if [ -n "${BAD_PODS}" ]; then
-              echo "Some pods are not healthy:"
-              echo "${BAD_PODS}"
-              exit 1
-            fi
-
             echo "=== Discover service, node IP and NodePorts ==="
             NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
 
@@ -220,9 +211,64 @@ jobs:
             echo "HTTP NodePort: ${HTTP_PORT}"
             echo "HTTPS NodePort: ${HTTPS_PORT}"
 
-            echo "=== Curl validation ==="
-            curl -vk -H "Host: ${HOST_HEADER}" "http://${NODE_IP}:${HTTP_PORT}/"
-            curl -vk -H "Host: ${HOST_HEADER}" "https://${NODE_IP}:${HTTPS_PORT}/"
+            echo "=== Initial curl validation ==="
+            HTTP_OK="false"
+            HTTPS_OK="false"
+
+            if curl -vk --fail-with-body -H "Host: ${HOST_HEADER}" "http://${NODE_IP}:${HTTP_PORT}/"; then
+              HTTP_OK="true"
+            fi
+
+            if curl -vk --fail-with-body -H "Host: ${HOST_HEADER}" "https://${NODE_IP}:${HTTPS_PORT}/"; then
+              HTTPS_OK="true"
+            fi
+
+            echo "HTTP_OK=${HTTP_OK}"
+            echo "HTTPS_OK=${HTTPS_OK}"
+
+            if [ "${HTTP_OK}" != "true" ] || [ "${HTTPS_OK}" != "true" ]; then
+              echo "Curl validation failed. Re-applying manifest and retrying."
+
+              kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
+
+              sleep 15
+
+              for i in $(seq 1 12); do
+                PROGRAMMED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+                echo "Retry attempt ${i}: Programmed=${PROGRAMMED:-<empty>}"
+                if [ "${PROGRAMMED}" = "True" ]; then
+                  break
+                fi
+                sleep 10
+              done
+
+              HTTP_OK="false"
+              HTTPS_OK="false"
+
+              if curl -vk --fail-with-body -H "Host: ${HOST_HEADER}" "http://${NODE_IP}:${HTTP_PORT}/"; then
+                HTTP_OK="true"
+              fi
+
+              if curl -vk --fail-with-body -H "Host: ${HOST_HEADER}" "https://${NODE_IP}:${HTTPS_PORT}/"; then
+                HTTPS_OK="true"
+              fi
+
+              echo "After re-apply: HTTP_OK=${HTTP_OK} HTTPS_OK=${HTTPS_OK}"
+
+              if [ "${HTTP_OK}" != "true" ] || [ "${HTTPS_OK}" != "true" ]; then
+                echo "Curl validation still failed after re-applying manifest."
+                exit 1
+              fi
+            fi
+
+            echo "=== Check pod health ==="
+            kubectl get pods -A
+            BAD_PODS="$(kubectl get pods -A --no-headers | awk '$4!="Running" && $4!="Completed" {print}')"
+            if [ -n "${BAD_PODS}" ]; then
+              echo "Some pods are not healthy:"
+              echo "${BAD_PODS}"
+              exit 1
+            fi
 
             cat > /tmp/gateway_benchmark_outputs.env <<EOF
             DEPLOYED_GATEWAY=${REQUESTED_GATEWAY}
