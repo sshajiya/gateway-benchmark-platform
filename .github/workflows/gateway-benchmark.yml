@@ -108,7 +108,14 @@ jobs:
             echo "Installed version: ${INSTALLED_VERSION}"
 
             if [ "${INSTALLED_GATEWAY}" = "${REQUESTED_GATEWAY}" ] && [ "${INSTALLED_VERSION}" = "${REQUESTED_VERSION}" ]; then
-              echo "Same gateway and version already installed. Skipping deployment."
+              echo "Same gateway and version already installed."
+
+              if kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" >/dev/null 2>&1; then
+                echo "Gateway resource already exists. Skipping deployment."
+              else
+                echo "Gateway resource missing. Re-applying manifest."
+                kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
+              fi
             else
               if [ "${INSTALLED_GATEWAY}" != "none" ] && [ "${INSTALLED_GATEWAY}" != "${REQUESTED_GATEWAY}" ]; then
                 echo "Conflicting gateway detected: ${INSTALLED_GATEWAY}. Cleaning it first."
@@ -130,20 +137,35 @@ jobs:
             echo "=== Wait for controller/data plane readiness ==="
             sleep 20
 
-            for i in $(seq 1 36); do
-              PROGRAMMED="$(kubectl get gateway -A -o jsonpath='{.items[0].status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+            echo "=== Wait for specific Gateway readiness ==="
+            echo "Checking gateway: ${GATEWAY_NAMESPACE}/${GATEWAY_NAME}"
+
+            if ! kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" >/dev/null 2>&1; then
+              echo "Gateway ${GATEWAY_NAMESPACE}/${GATEWAY_NAME} does not exist"
+              kubectl get gateway -A || true
+              exit 1
+            fi
+
+            for i in $(seq 1 18); do
+              PROGRAMMED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+              ACCEPTED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)"
+
+              echo "Attempt ${i}: Accepted=${ACCEPTED:-<empty>} Programmed=${PROGRAMMED:-<empty>}"
+
               if [ "${PROGRAMMED}" = "True" ]; then
                 echo "Gateway Programmed=True"
                 break
               fi
-              echo "Waiting for Gateway Programmed=True (${i}/36)"
+
               sleep 10
             done
 
-            PROGRAMMED="$(kubectl get gateway -A -o jsonpath='{.items[0].status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+            PROGRAMMED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
             if [ "${PROGRAMMED}" != "True" ]; then
               echo "Gateway failed to reach Programmed=True"
-              kubectl get gateway -A -o yaml || true
+              kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o yaml || true
+              kubectl get gateway -A || true
+              kubectl get httproute -A || true
               exit 1
             fi
 
