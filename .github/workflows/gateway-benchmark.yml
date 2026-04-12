@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Validate input files exist
         run: |
@@ -42,6 +44,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Copy deployment files to master
         uses: appleboy/scp-action@v0.1.7
@@ -73,6 +77,14 @@ jobs:
 
             echo "Requested gateway: ${REQUESTED_GATEWAY}"
             echo "Requested version: ${REQUESTED_VERSION}"
+            echo "Loaded metadata:"
+            echo "GATEWAY_NAMESPACE=${GATEWAY_NAMESPACE:-<unset>}"
+            echo "GATEWAY_NAME=${GATEWAY_NAME:-<unset>}"
+            echo "SERVICE_NAMESPACE=${SERVICE_NAMESPACE:-<unset>}"
+            echo "SERVICE_NAME_REGEX=${SERVICE_NAME_REGEX:-<unset>}"
+            echo "HOST_HEADER=${HOST_HEADER:-<unset>}"
+            echo "REMOTE_BASE=${REMOTE_BASE}"
+            echo "COMMON_BASE=${COMMON_BASE}"
 
             echo "=== Cluster node health ==="
             kubectl get nodes -o wide
@@ -134,9 +146,6 @@ jobs:
               kubectl apply -f "${REMOTE_BASE}/gateway.yaml"
             fi
 
-            echo "=== Wait for controller/data plane readiness ==="
-            sleep 20
-
             echo "=== Wait for specific Gateway readiness ==="
             echo "Checking gateway: ${GATEWAY_NAMESPACE}/${GATEWAY_NAME}"
 
@@ -146,9 +155,11 @@ jobs:
               exit 1
             fi
 
+            sleep 15
+
             for i in $(seq 1 18); do
-              PROGRAMMED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
               ACCEPTED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)"
+              PROGRAMMED="$(kubectl -n "${GATEWAY_NAMESPACE}" get gateway "${GATEWAY_NAME}" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
 
               echo "Attempt ${i}: Accepted=${ACCEPTED:-<empty>} Programmed=${PROGRAMMED:-<empty>}"
 
@@ -259,6 +270,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Copy test scripts to traffic generator
         uses: appleboy/scp-action@v0.1.7
@@ -290,9 +303,9 @@ jobs:
             export GATEWAY="${GATEWAY}"
             export VERSION="${VERSION}"
 
-            echo $TARGET_NODE_IP
-            echo $TARGET_HTTP_PORT
-            echo $TARGET_HTTPS_PORT
+            echo "TARGET_NODE_IP=${TARGET_NODE_IP}"
+            echo "TARGET_HTTP_PORT=${TARGET_HTTP_PORT}"
+            echo "TARGET_HTTPS_PORT=${TARGET_HTTPS_PORT}"
 
             k6 run m01-throughput.js --summary-export /tmp/gateway-results/raw/m01-throughput.json
             k6 run m04-tls-handshake.js --summary-export /tmp/gateway-results/raw/m04-tls-handshake.json
