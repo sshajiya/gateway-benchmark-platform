@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: perf-backend-html
+  namespace: default
+data:
+  index.html: |
+    AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perf-backend
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: perf-backend
+  template:
+    metadata:
+      labels:
+        app: perf-backend
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: html
+          configMap:
+            name: perf-backend-html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perf-backend-svc
+  namespace: default
+spec:
+  selector:
+    app: perf-backend
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
