@@ -100,10 +100,35 @@ jobs:
             else
               echo "Skipping deployment"
             fi
-
             echo "=== Wait for Gateway ==="
             sleep 20
+            echo "=== Converting Envoy service to NodePort ==="
 
+            SVC=$(kubectl -n envoy-gateway-system get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep envoy-default)
+
+            echo "Service found: $SVC"
+
+            kubectl -n envoy-gateway-system patch svc "$SVC" \
+              -p '{"spec":{"type":"NodePort"}}'
+
+            kubectl get svc -n envoy-gateway-system
+
+            echo "=== Waiting for Gateway Programmed ==="
+
+            for i in $(seq 1 20); do
+              STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
+                -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
+
+              echo "Attempt $i: Programmed=${STATUS:-<empty>}"
+
+              if [ "$STATUS" = "True" ]; then
+                echo "Gateway is ready"
+                break
+              fi
+
+              sleep 10
+            done
+            
             NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
             SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "$SERVICE_NAME_REGEX" | head -n1)

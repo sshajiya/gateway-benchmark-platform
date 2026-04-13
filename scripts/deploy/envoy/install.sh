@@ -14,22 +14,17 @@ echo "=== Installing Envoy Gateway ${VERSION} ==="
 kubectl apply --server-side -f "https://github.com/envoyproxy/gateway/releases/download/${VERSION}/install.yaml"
 
 echo "=== Waiting for Envoy deployment ==="
-
 for i in $(seq 1 30); do
   READY=$(kubectl -n envoy-gateway-system get deploy envoy-gateway -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-
   echo "Attempt $i: ReadyReplicas=$READY"
-
   if [ "$READY" = "1" ]; then
     echo "Envoy is ready"
     break
   fi
-
   sleep 10
 done
 
 READY=$(kubectl -n envoy-gateway-system get deploy envoy-gateway -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-
 if [ "$READY" != "1" ]; then
   echo "❌ Envoy failed to start"
   kubectl get pods -n envoy-gateway-system
