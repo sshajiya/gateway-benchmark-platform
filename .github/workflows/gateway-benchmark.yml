@@ -141,8 +141,16 @@ jobs:
             echo "HTTPS_PORT=$HTTPS_PORT"
 
             echo "=== CURL TEST ==="
-            curl -vk --fail-with-body -H "Host: $HOST_HEADER" "http://$NODE_IP:$HTTP_PORT/"
-            curl -vk --fail-with-body -H "Host: $HOST_HEADER" "https://$NODE_IP:$HTTPS_PORT/"
+
+            # HTTP (works with Host header)
+            curl -vk --fail-with-body --max-time 10 \
+            -H "Host: $HOST_HEADER" \
+            "http://$NODE_IP:$HTTP_PORT/"
+
+            # HTTPS (needs SNI → use --resolve)
+            curl -vk --fail-with-body --max-time 10 \
+            --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
+            "https://$HOST_HEADER:$HTTPS_PORT/"
 
             cat > /tmp/output.env <<EOF
             NODE_IP=$NODE_IP
