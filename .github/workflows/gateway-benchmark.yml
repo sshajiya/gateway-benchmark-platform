@@ -75,6 +75,7 @@ jobs:
               kubectl delete gateway --all -A --ignore-not-found || true
               kubectl delete httproute --all -A --ignore-not-found || true
               kubectl delete gatewayclass --all --ignore-not-found || true
+              kubectl delete envoyproxy --all -A --ignore-not-found || true
               "${COMMON}/cleanup_gateway.sh" "$GATEWAY" || true
             fi
 
@@ -88,49 +89,42 @@ jobs:
               kubectl get pods -n default -o wide
               kubectl get svc perf-backend-svc -n default
 
+              if [ "$GATEWAY" = "envoy" ]; then
+                echo "=== Creating EnvoyProxy override for NodePort ==="
+                cat <<EOF | kubectl apply -f -
+                apiVersion: gateway.envoyproxy.io/v1alpha1
+                kind: EnvoyProxy
+                metadata:
+                  name: ${GATEWAY_NAME}-nodeport
+                  namespace: ${GATEWAY_NAMESPACE}
+                spec:
+                  provider:
+                    type: Kubernetes
+                    kubernetes:
+                      envoyService:
+                        patch:
+                          type: StrategicMerge
+                          value:
+                            spec:
+                              type: NodePort
+                EOF
+              fi
+
               echo "=== Applying gateway config ==="
               kubectl apply -f "${BASE}/gateway.yaml"
+
+              if [ "$GATEWAY" = "envoy" ]; then
+                echo "=== Linking Gateway to EnvoyProxy NodePort config ==="
+                kubectl -n "$GATEWAY_NAMESPACE" patch gateway "$GATEWAY_NAME" --type merge -p \
+                  "{\"spec\":{\"infrastructure\":{\"parametersRef\":{\"group\":\"gateway.envoyproxy.io\",\"kind\":\"EnvoyProxy\",\"name\":\"${GATEWAY_NAME}-nodeport\"}}}}"
+              fi
             else
               echo "Skipping deployment"
             fi
 
-            if [ "$GATEWAY" = "envoy" ]; then
-              echo "=== Waiting for Envoy data-plane service ==="
-
-              SVC=""
-              for i in $(seq 1 30); do
-                SVC=$(kubectl -n envoy-gateway-system get svc \
-                  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
-                  | grep '^envoy-default-' | head -n1 || true)
-
-                if [ -n "${SVC:-}" ]; then
-                  echo "Found Envoy service on attempt $i: $SVC"
-                  break
-                fi
-
-                echo "Attempt $i: Envoy service not found yet"
-                kubectl get svc -n envoy-gateway-system || true
-                sleep 5
-              done
-
-              if [ -z "${SVC:-}" ]; then
-                echo "Envoy data-plane service was not found"
-                kubectl get svc -n envoy-gateway-system || true
-                kubectl get gateway -A || true
-                kubectl describe gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" || true
-                exit 1
-              fi
-
-              echo "=== Converting Envoy service to NodePort ==="
-              kubectl -n envoy-gateway-system patch svc "$SVC" \
-                -p '{"spec":{"type":"NodePort"}}'
-
-              kubectl get svc -n envoy-gateway-system
-            fi
-
             echo "=== Waiting for Gateway Listener Programmed ==="
             READY="false"
-            for i in $(seq 1 20); do
+            for i in $(seq 1 24); do
               STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
                 -o jsonpath='{range .status.listeners[*].conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null \
                 | grep 'Programmed=True' || true)
@@ -158,12 +152,22 @@ jobs:
             kubectl get httproute -A || true
             kubectl get svc -A || true
 
-            NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-            echo "NODE_IP=$NODE_IP"
+            echo "=== Finding generated service ==="
+            SERVICE_NAME=""
+            for i in $(seq 1 30); do
+              SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+                | grep -E "$SERVICE_NAME_REGEX" | head -n1 || true)
 
-            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
-              -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
-              | grep -E "$SERVICE_NAME_REGEX" | head -n1 || true)
+              if [ -n "${SERVICE_NAME:-}" ]; then
+                echo "Found service on attempt $i: $SERVICE_NAME"
+                break
+              fi
+
+              echo "Attempt $i: matching service not found yet"
+              kubectl get svc -n "$SERVICE_NAMESPACE" || true
+              sleep 5
+            done
 
             if [ -z "${SERVICE_NAME:-}" ]; then
               echo "No matching service found in namespace $SERVICE_NAMESPACE"
@@ -171,11 +175,43 @@ jobs:
               exit 1
             fi
 
+            if [ "$GATEWAY" = "envoy" ]; then
+              echo "=== Waiting for Envoy service to become NodePort ==="
+              FINAL_TYPE=""
+              HTTP_PORT=""
+              HTTPS_PORT=""
+
+              for i in $(seq 1 30); do
+                FINAL_TYPE=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.type}')
+                HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
+                  -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
+                HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
+                  -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+
+                echo "Attempt $i: TYPE=$FINAL_TYPE HTTP_PORT=${HTTP_PORT:-<empty>} HTTPS_PORT=${HTTPS_PORT:-<empty>}"
+
+                if [ "$FINAL_TYPE" = "NodePort" ] && [ -n "${HTTP_PORT:-}" ]; then
+                  break
+                fi
+
+                sleep 5
+              done
+
+              if [ "${FINAL_TYPE:-}" != "NodePort" ]; then
+                echo "Envoy service is still not NodePort"
+                kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+                kubectl get envoyproxy -A || true
+                kubectl get gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" -o yaml || true
+                exit 1
+              fi
+            fi
+
+            NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+            echo "NODE_IP=$NODE_IP"
             echo "SERVICE_NAME=$SERVICE_NAME"
 
             HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
               -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-
             HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
               -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
 
