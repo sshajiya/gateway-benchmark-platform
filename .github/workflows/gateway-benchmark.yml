@@ -175,7 +175,11 @@ jobs:
       - name: Export benchmark target
         run: |
           set -eo pipefail
-          printf '%s\n' '${{ steps.fetch_target.outputs.stdout }}' > benchmark-target.env
+
+          printf '%s\n' '${{ steps.fetch_target.outputs.stdout }}' > benchmark-target-raw.env
+          cat benchmark-target-raw.env
+
+          sed -n 's/^out: //p' benchmark-target-raw.env > benchmark-target.env
           cat benchmark-target.env
 
           NODE_IP=$(grep '^NODE_IP=' benchmark-target.env | head -n1 | cut -d= -f2-)
@@ -184,6 +188,12 @@ jobs:
           HOST_HEADER=$(grep '^HOST_HEADER=' benchmark-target.env | head -n1 | cut -d= -f2-)
           GATEWAY=$(grep '^GATEWAY=' benchmark-target.env | head -n1 | cut -d= -f2-)
           VERSION=$(grep '^VERSION=' benchmark-target.env | head -n1 | cut -d= -f2-)
+
+          test -n "$NODE_IP"
+          test -n "$HTTP_PORT"
+          test -n "$HOST_HEADER"
+          test -n "$GATEWAY"
+          test -n "$VERSION"
 
           echo "NODE_IP=$NODE_IP" >> "$GITHUB_ENV"
           echo "HTTP_PORT=$HTTP_PORT" >> "$GITHUB_ENV"
