@@ -19,184 +19,42 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Copy scripts to master
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.MASTER_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "scripts"
-          target: "/tmp/gateway-benchmark"
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' '${{ secrets.SSH_KEY }}' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
 
-      - name: Discover benchmark target on master
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.MASTER_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          script_stop: true
-          script: |
+      - name: Discover target from master
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "${{ secrets.USERNAME }}@${{ secrets.MASTER_IP }}" '
             set -eo pipefail
 
             GATEWAY="${{ github.event.inputs.gateway }}"
-            VERSION="${{ github.event.inputs.version }}"
             BASE="/tmp/gateway-benchmark/scripts/deploy/${GATEWAY}"
 
             . "${BASE}/metadata.env"
 
-            echo "=== INPUTS ==="
-            echo "GATEWAY=$GATEWAY"
-            echo "VERSION=$VERSION"
-            echo "GATEWAY_NAMESPACE=$GATEWAY_NAMESPACE"
-            echo "GATEWAY_NAME=$GATEWAY_NAME"
-            echo "SERVICE_NAMESPACE=$SERVICE_NAMESPACE"
-            echo "SERVICE_NAME_REGEX=$SERVICE_NAME_REGEX"
-            echo "HOST_HEADER=$HOST_HEADER"
+            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
+              -o jsonpath="{range .items[*]}{.metadata.name}{\"\n\"}{end}" \
+              | grep -E "$SERVICE_NAME_REGEX" | head -n1)
 
-            echo "=== Checking gateway listener readiness ==="
-            STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
-              -o jsonpath='{range .status.listeners[*].conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null \
-              | grep 'Programmed=True' || true)
+            NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[?(@.type==\"InternalIP\")].address}")
+            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath="{.spec.ports[?(@.port==80)].nodePort}")
+            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath="{.spec.ports[?(@.port==443)].nodePort}")
 
-            if [[ "$STATUS" != *"Programmed=True"* ]]; then
-              echo "Gateway listener is not ready"
-              kubectl get gateway -A || true
-              kubectl describe gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" || true
-              exit 1
-            fi
-
-            echo "=== Finding service ==="
-            SERVICE_NAME=""
-            for i in $(seq 1 20); do
-              SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
-                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
-                | grep -E "$SERVICE_NAME_REGEX" | head -n1 || true)
-
-              if [ -n "${SERVICE_NAME:-}" ]; then
-                echo "Found service on attempt $i: $SERVICE_NAME"
-                break
-              fi
-
-              echo "Attempt $i: service not found yet"
-              kubectl get svc -n "$SERVICE_NAMESPACE" || true
-              sleep 5
-            done
-
-            if [ -z "${SERVICE_NAME:-}" ]; then
-              echo "No matching service found in namespace $SERVICE_NAMESPACE"
-              kubectl get svc -n "$SERVICE_NAMESPACE" || true
-              exit 1
-            fi
-
-            SERVICE_TYPE=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.type}')
-            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
-            NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-
-            echo "SERVICE_NAME=$SERVICE_NAME"
-            echo "SERVICE_TYPE=$SERVICE_TYPE"
             echo "NODE_IP=$NODE_IP"
-            echo "HTTP_PORT=${HTTP_PORT:-<empty>}"
-            echo "HTTPS_PORT=${HTTPS_PORT:-<empty>}"
+            echo "HTTP_PORT=$HTTP_PORT"
+            echo "HTTPS_PORT=$HTTPS_PORT"
             echo "HOST_HEADER=$HOST_HEADER"
+            echo "GATEWAY=${{ github.event.inputs.gateway }}"
+            echo "VERSION=${{ github.event.inputs.version }}"
+          ' > benchmark-target.env
 
-            if [ "$GATEWAY" = "envoy" ] && [ "$SERVICE_TYPE" != "NodePort" ]; then
-              echo "Envoy service is not NodePort"
-              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
-              exit 1
-            fi
+          cat benchmark-target.env
 
-            if [ -z "${NODE_IP:-}" ] || [ -z "${HTTP_PORT:-}" ] || [ -z "${HOST_HEADER:-}" ]; then
-              echo "Missing required benchmark values"
-              exit 1
-            fi
-
-            echo "=== Waiting for HTTP NodePort reachability ==="
-            HTTP_READY="false"
-            for i in $(seq 1 30); do
-              if curl -sS -o /dev/null --max-time 5 \
-                -H "Host: $HOST_HEADER" \
-                "http://$NODE_IP:$HTTP_PORT/"; then
-                HTTP_READY="true"
-                echo "HTTP ready on attempt $i"
-                break
-              fi
-
-              echo "Attempt $i: HTTP not reachable yet"
-              sleep 5
-            done
-
-            if [ "$HTTP_READY" != "true" ]; then
-              echo "HTTP NodePort never became reachable"
-              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
-              kubectl get pods -n envoy-gateway-system -o wide || true
-              exit 1
-            fi
-
-            if [ -n "${HTTPS_PORT:-}" ]; then
-              echo "=== Waiting for HTTPS NodePort reachability ==="
-              for i in $(seq 1 30); do
-                if curl -ksS -o /dev/null --max-time 5 \
-                  --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
-                  "https://$HOST_HEADER:$HTTPS_PORT/"; then
-                  echo "HTTPS ready on attempt $i"
-                  break
-                fi
-
-                echo "Attempt $i: HTTPS not reachable yet"
-                sleep 5
-              done
-            fi
-
-            printf '%s\n' "NODE_IP=$NODE_IP" > /tmp/benchmark-target.env
-            printf '%s\n' "HTTP_PORT=$HTTP_PORT" >> /tmp/benchmark-target.env
-            printf '%s\n' "HTTPS_PORT=$HTTPS_PORT" >> /tmp/benchmark-target.env
-            printf '%s\n' "HOST_HEADER=$HOST_HEADER" >> /tmp/benchmark-target.env
-            printf '%s\n' "GATEWAY=$GATEWAY" >> /tmp/benchmark-target.env
-            printf '%s\n' "VERSION=$VERSION" >> /tmp/benchmark-target.env
-
-            echo "=== benchmark-target.env ==="
-            cat /tmp/benchmark-target.env
-
-      - name: Download benchmark target file
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.MASTER_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "/tmp/benchmark-target.env"
-          target: "./"
-
-      - name: Export benchmark target
-        run: |
-          set -eo pipefail
-
-          echo "=== Downloaded benchmark target file ==="
-          find . -type f | sort | grep benchmark-target || true
-          cat ./tmp/benchmark-target.env
-
-          NODE_IP=$(grep '^NODE_IP=' ./tmp/benchmark-target.env | cut -d= -f2-)
-          HTTP_PORT=$(grep '^HTTP_PORT=' ./tmp/benchmark-target.env | cut -d= -f2-)
-          HTTPS_PORT=$(grep '^HTTPS_PORT=' ./tmp/benchmark-target.env | cut -d= -f2-)
-          HOST_HEADER=$(grep '^HOST_HEADER=' ./tmp/benchmark-target.env | cut -d= -f2-)
-          GATEWAY=$(grep '^GATEWAY=' ./tmp/benchmark-target.env | cut -d= -f2-)
-          VERSION=$(grep '^VERSION=' ./tmp/benchmark-target.env | cut -d= -f2-)
-
-          echo "NODE_IP=$NODE_IP"
-          echo "HTTP_PORT=$HTTP_PORT"
-          echo "HTTPS_PORT=$HTTPS_PORT"
-          echo "HOST_HEADER=$HOST_HEADER"
-          echo "GATEWAY=$GATEWAY"
-          echo "VERSION=$VERSION"
-
-          test -n "$NODE_IP"
-          test -n "$HTTP_PORT"
-          test -n "$HOST_HEADER"
-          test -n "$GATEWAY"
-          test -n "$VERSION"
+          . ./benchmark-target.env
 
           echo "NODE_IP=$NODE_IP" >> "$GITHUB_ENV"
           echo "HTTP_PORT=$HTTP_PORT" >> "$GITHUB_ENV"
@@ -205,89 +63,59 @@ jobs:
           echo "GATEWAY=$GATEWAY" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Copy k6 scripts to traffic generator
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.TG_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "scripts/tests"
-          target: "/tmp/gateway-benchmark"
+      - name: Copy test scripts to traffic generator
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}" 'mkdir -p /tmp/gateway-benchmark'
+          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -r \
+            scripts/tests \
+            "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}:/tmp/gateway-benchmark/"
 
       - name: Run k6 tests on traffic generator
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.TG_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          script_stop: true
-          envs: NODE_IP,HTTP_PORT,HTTPS_PORT,HOST_HEADER,GATEWAY,VERSION
-          script: |
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}" "
             set -eo pipefail
-
             mkdir -p /tmp/k6-results
             rm -f /tmp/k6-results/*.json || true
+            cd /tmp/gateway-benchmark/tests
 
-            cd /tmp/gateway-benchmark/scripts/tests
+            export TARGET_NODE_IP='${NODE_IP}'
+            export TARGET_HTTP_PORT='${HTTP_PORT}'
+            export TARGET_HTTPS_PORT='${HTTPS_PORT}'
+            export TARGET_HOST='${HOST_HEADER}'
+            export GATEWAY='${GATEWAY}'
+            export VERSION='${VERSION}'
 
-            export TARGET_HOST="${HOST_HEADER}"
-            export TARGET_NODE_IP="${NODE_IP}"
-            export TARGET_HTTP_PORT="${HTTP_PORT}"
-            export TARGET_HTTPS_PORT="${HTTPS_PORT:-}"
-            export GATEWAY="${GATEWAY}"
-            export VERSION="${VERSION}"
+            echo 'Running throughput test'
+            k6 run m01-throughput.js --summary-export=/tmp/k6-results/m01-throughput.json
 
-            echo "=== Benchmark Inputs ==="
-            echo "TARGET_HOST=$TARGET_HOST"
-            echo "TARGET_NODE_IP=$TARGET_NODE_IP"
-            echo "TARGET_HTTP_PORT=$TARGET_HTTP_PORT"
-            echo "TARGET_HTTPS_PORT=${TARGET_HTTPS_PORT:-<empty>}"
-            echo "GATEWAY=$GATEWAY"
-            echo "VERSION=$VERSION"
-
-            echo "=== Running m01-throughput.js ==="
-            k6 run m01-throughput.js \
-              --summary-export=/tmp/k6-results/m01-throughput.json
-
-            if [ -f m04-tls-handshake.js ] && [ -n "${TARGET_HTTPS_PORT:-}" ]; then
-              echo "=== Running m04-tls-handshake.js ==="
-              k6 run m04-tls-handshake.js \
-                --summary-export=/tmp/k6-results/m04-tls-handshake.json
-            else
-              echo "Skipping m04-tls-handshake.js"
+            if [ -f m04-tls-handshake.js ] && [ -n \"${TARGET_HTTPS_PORT}\" ]; then
+              echo 'Running TLS handshake test'
+              k6 run m04-tls-handshake.js --summary-export=/tmp/k6-results/m04-tls-handshake.json
             fi
 
-            if [ -f m05-route-propagation.js ]; then
-              echo "=== Running m05-route-propagation.js ==="
-              k6 run m05-route-propagation.js \
-                --summary-export=/tmp/k6-results/m05-route-propagation.json
-            else
-              echo "Skipping m05-route-propagation.js"
-            fi
-
-            printf '%s\n' '{' > /tmp/k6-results/run-metadata.json
-            printf '%s\n' "  \"gateway\": \"${GATEWAY}\"," >> /tmp/k6-results/run-metadata.json
-            printf '%s\n' "  \"version\": \"${VERSION}\"," >> /tmp/k6-results/run-metadata.json
-            printf '%s\n' "  \"node_ip\": \"${NODE_IP}\"," >> /tmp/k6-results/run-metadata.json
-            printf '%s\n' "  \"http_port\": \"${HTTP_PORT}\"," >> /tmp/k6-results/run-metadata.json
-            printf '%s\n' "  \"https_port\": \"${HTTPS_PORT:-}\"," >> /tmp/k6-results/run-metadata.json
-            printf '%s\n' "  \"host_header\": \"${HOST_HEADER}\"" >> /tmp/k6-results/run-metadata.json
-            printf '%s\n' '}' >> /tmp/k6-results/run-metadata.json
+            cat > /tmp/k6-results/run-metadata.json <<EOF
+            {
+              \"gateway\": \"${GATEWAY}\",
+              \"version\": \"${VERSION}\",
+              \"node_ip\": \"${TARGET_NODE_IP}\",
+              \"http_port\": \"${TARGET_HTTP_PORT}\",
+              \"https_port\": \"${TARGET_HTTPS_PORT}\",
+              \"host_header\": \"${TARGET_HOST}\"
+            }
+            EOF
 
             ls -l /tmp/k6-results
+          "
 
-      - name: Download k6 results
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.TG_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "/tmp/k6-results/*"
-          target: "./downloaded-results"
+      - name: Download results from traffic generator
+        run: |
+          mkdir -p downloaded-results
+          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -r \
+            "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}:/tmp/k6-results" \
+            ./downloaded-results/
 
       - name: Show downloaded files
         run: |
-          set -eo pipefail
           find ./downloaded-results -type f | sort
 
       - name: Set up Python
@@ -297,7 +125,6 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          set -eo pipefail
           python -m pip install --upgrade pip
           if [ -f scripts/report/requirements.txt ]; then
             pip install -r scripts/report/requirements.txt
@@ -305,13 +132,12 @@ jobs:
 
       - name: Generate webpage
         run: |
-          set -eo pipefail
           mkdir -p public
           python scripts/report/generate_dashboard.py \
-            --results-dir "./downloaded-results/tmp/k6-results" \
+            --results-dir "./downloaded-results/k6-results" \
             --output-dir "./public"
 
-      - name: Upload benchmark artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: gateway-benchmark-results
