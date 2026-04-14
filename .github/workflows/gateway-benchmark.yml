@@ -128,21 +128,22 @@ jobs:
               kubectl get svc -n envoy-gateway-system
             fi
 
-            echo "=== Waiting for Gateway Programmed ==="
+            echo "=== Waiting for Gateway Listener Programmed ==="
             READY="false"
             for i in $(seq 1 20); do
               STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
-                -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
+                -o jsonpath='{range .status.listeners[*].conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null \
+                | grep 'Programmed=True' || true)
 
-              echo "Attempt $i: Programmed=${STATUS:-<empty>}"
+              echo "Attempt $i: ${STATUS:-NotReady}"
 
-              if [ "$STATUS" = "True" ]; then
+              if [[ "$STATUS" == *"Programmed=True"* ]]; then
                 READY="true"
-                echo "Gateway is ready"
+                echo "Gateway is ready (listener programmed)"
                 break
               fi
 
-              sleep 10
+              sleep 5
             done
 
             if [ "$READY" != "true" ]; then
