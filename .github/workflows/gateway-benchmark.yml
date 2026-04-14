@@ -91,24 +91,10 @@ jobs:
 
               if [ "$GATEWAY" = "envoy" ]; then
                 echo "=== Creating EnvoyProxy override for NodePort ==="
-                cat >/tmp/envoyproxy-nodeport.yaml <<'EOF'
-            apiVersion: gateway.envoyproxy.io/v1alpha1
-            kind: EnvoyProxy
-            metadata:
-              name: envoy-gateway-nodeport
-              namespace: default
-            spec:
-              provider:
-                type: Kubernetes
-                kubernetes:
-                  envoyService:
-                    patch:
-                      type: StrategicMerge
-                      value:
-                        spec:
-                          type: NodePort
-            EOF
-                kubectl apply -f /tmp/envoyproxy-nodeport.yaml
+                cat >/tmp/envoyproxy-nodeport.json <<'EOF'
+{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"EnvoyProxy","metadata":{"name":"envoy-gateway-nodeport","namespace":"default"},"spec":{"provider":{"type":"Kubernetes","kubernetes":{"envoyService":{"patch":{"type":"StrategicMerge","value":{"spec":{"type":"NodePort"}}}}}}}}
+EOF
+                kubectl apply -f /tmp/envoyproxy-nodeport.json
               fi
 
               echo "=== Applying gateway config ==="
