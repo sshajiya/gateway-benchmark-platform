@@ -32,7 +32,6 @@ jobs:
           target: "/tmp/gateway-benchmark"
 
       - name: Discover benchmark target on master
-        id: discover_target
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.MASTER_IP }}
@@ -40,7 +39,7 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script_stop: true
           script: |
-            set -euo pipefail
+            set -eo pipefail
 
             GATEWAY="${{ github.event.inputs.gateway }}"
             VERSION="${{ github.event.inputs.version }}"
@@ -159,35 +158,39 @@ jobs:
             printf '%s\n' "GATEWAY=$GATEWAY" >> /tmp/benchmark-target.env
             printf '%s\n' "VERSION=$VERSION" >> /tmp/benchmark-target.env
 
+            echo "=== benchmark-target.env ==="
             cat /tmp/benchmark-target.env
 
-      - name: Fetch discovered target
-        id: fetch_target
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Download benchmark target file
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.MASTER_IP }}
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          script_stop: true
-          script: |
-            cat /tmp/benchmark-target.env
+          source: "/tmp/benchmark-target.env"
+          target: "./"
 
       - name: Export benchmark target
         run: |
           set -eo pipefail
 
-          printf '%s\n' '${{ steps.fetch_target.outputs.stdout }}' > benchmark-target-raw.env
-          cat benchmark-target-raw.env
+          echo "=== Downloaded benchmark target file ==="
+          find . -type f | sort | grep benchmark-target || true
+          cat ./tmp/benchmark-target.env
 
-          sed -n 's/^out: //p' benchmark-target-raw.env > benchmark-target.env
-          cat benchmark-target.env
+          NODE_IP=$(grep '^NODE_IP=' ./tmp/benchmark-target.env | cut -d= -f2-)
+          HTTP_PORT=$(grep '^HTTP_PORT=' ./tmp/benchmark-target.env | cut -d= -f2-)
+          HTTPS_PORT=$(grep '^HTTPS_PORT=' ./tmp/benchmark-target.env | cut -d= -f2-)
+          HOST_HEADER=$(grep '^HOST_HEADER=' ./tmp/benchmark-target.env | cut -d= -f2-)
+          GATEWAY=$(grep '^GATEWAY=' ./tmp/benchmark-target.env | cut -d= -f2-)
+          VERSION=$(grep '^VERSION=' ./tmp/benchmark-target.env | cut -d= -f2-)
 
-          NODE_IP=$(grep '^NODE_IP=' benchmark-target.env | head -n1 | cut -d= -f2-)
-          HTTP_PORT=$(grep '^HTTP_PORT=' benchmark-target.env | head -n1 | cut -d= -f2-)
-          HTTPS_PORT=$(grep '^HTTPS_PORT=' benchmark-target.env | head -n1 | cut -d= -f2-)
-          HOST_HEADER=$(grep '^HOST_HEADER=' benchmark-target.env | head -n1 | cut -d= -f2-)
-          GATEWAY=$(grep '^GATEWAY=' benchmark-target.env | head -n1 | cut -d= -f2-)
-          VERSION=$(grep '^VERSION=' benchmark-target.env | head -n1 | cut -d= -f2-)
+          echo "NODE_IP=$NODE_IP"
+          echo "HTTP_PORT=$HTTP_PORT"
+          echo "HTTPS_PORT=$HTTPS_PORT"
+          echo "HOST_HEADER=$HOST_HEADER"
+          echo "GATEWAY=$GATEWAY"
+          echo "VERSION=$VERSION"
 
           test -n "$NODE_IP"
           test -n "$HTTP_PORT"
@@ -220,7 +223,7 @@ jobs:
           script_stop: true
           envs: NODE_IP,HTTP_PORT,HTTPS_PORT,HOST_HEADER,GATEWAY,VERSION
           script: |
-            set -euo pipefail
+            set -eo pipefail
 
             mkdir -p /tmp/k6-results
             rm -f /tmp/k6-results/*.json || true
@@ -284,7 +287,7 @@ jobs:
 
       - name: Show downloaded files
         run: |
-          set -euo pipefail
+          set -eo pipefail
           find ./downloaded-results -type f | sort
 
       - name: Set up Python
@@ -294,7 +297,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          set -euo pipefail
+          set -eo pipefail
           python -m pip install --upgrade pip
           if [ -f scripts/report/requirements.txt ]; then
             pip install -r scripts/report/requirements.txt
@@ -302,7 +305,7 @@ jobs:
 
       - name: Generate webpage
         run: |
-          set -euo pipefail
+          set -eo pipefail
           mkdir -p public
           python scripts/report/generate_dashboard.py \
             --results-dir "./downloaded-results/tmp/k6-results" \
