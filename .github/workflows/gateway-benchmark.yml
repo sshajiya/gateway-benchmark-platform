@@ -21,7 +21,7 @@ on:
         default: "true"
 
 jobs:
-  deploy-validate:
+  deploy-Gateway:
     runs-on: ubuntu-latest
 
     steps:
