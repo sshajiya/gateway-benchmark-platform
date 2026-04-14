@@ -1,0 +1,32 @@
+Mitre framework
+•Tactic Testing
+•Privilege escalation
+•Collection
+•reconnissance
+•resource developement 
+•command and control – Verify w.r.t bigip
+•Impact -verify w.r.t bigip
+•summary table
+•DC Articles
+AI guardrails
+•Setup
+•Testing
+•Automation ()
+Benchmark Testing
+CNF Testing
+ADSP
+Workload Deployement for BIG-IP in  Vmware, Nutanix and OCP
+•Github Guide
+•DC Articles
+HeatMap & SecureIQ
+•OWASP Web Top 10 – 2021
+•Manual Testing
+•Automation (efficacy) 
+•Dashboard Creation using Allure
+•Dashboard Enhancements
+•OWASP 2021—> scoreboard, full details
+•OWASP  2025—> scoreboard, full details
+•Tab. Test Result => OWasp 2021,2025, secureIQ(pass, fail,falsepositive) Drop Down
+•Tab. Feedback with dropdown of OWasp 2021,2025, secureIQ test cases to select and give comments
+•
+•

@@ -1,0 +1,272 @@
+name: Gateway Deploy and Validate
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway:
+        description: "envoy | ngf | cilium"
+        required: true
+        default: "envoy"
+      version:
+        description: "gateway version"
+        required: true
+        default: "v1.7.1"
+      destroy:
+        description: "Destroy existing gateway? (true/false)"
+        required: true
+        default: "false"
+      deploy:
+        description: "Deploy gateway? (true/false)"
+        required: true
+        default: "true"
+
+jobs:
+  deploy-Gateway:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Copy scripts to master
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.MASTER_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          source: "scripts"
+          target: "/tmp/gateway-benchmark"
+
+      - name: Run deployment and curl validation
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.MASTER_IP }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            GATEWAY="${{ github.event.inputs.gateway }}"
+            VERSION="${{ github.event.inputs.version }}"
+            DESTROY="${{ github.event.inputs.destroy }}"
+            DEPLOY="${{ github.event.inputs.deploy }}"
+
+            BASE="/tmp/gateway-benchmark/scripts/deploy/${GATEWAY}"
+            COMMON="/tmp/gateway-benchmark/scripts/deploy/common"
+
+            chmod +x "${COMMON}/cleanup_gateway.sh"
+            chmod +x "${BASE}/install.sh"
+
+            . "${BASE}/metadata.env"
+
+            echo "=== INPUTS ==="
+            echo "GATEWAY=$GATEWAY"
+            echo "VERSION=$VERSION"
+            echo "DESTROY=$DESTROY"
+            echo "DEPLOY=$DEPLOY"
+
+            echo "=== Node Health ==="
+            kubectl get nodes -o wide
+
+            if [ "$DESTROY" = "true" ]; then
+              echo "=== Destroying existing gateways ==="
+              kubectl delete gateway --all -A --ignore-not-found || true
+              kubectl delete httproute --all -A --ignore-not-found || true
+              kubectl delete gatewayclass --all --ignore-not-found || true
+              kubectl delete envoyproxy --all -A --ignore-not-found || true
+              "${COMMON}/cleanup_gateway.sh" "$GATEWAY" || true
+            fi
+
+            if [ "$DEPLOY" = "true" ]; then
+              echo "=== Deploying gateway ==="
+              "${BASE}/install.sh" "$VERSION"
+
+              echo "=== Deploying backend app ==="
+              kubectl apply -f /tmp/gateway-benchmark/scripts/apps/perf-backend.yaml
+              kubectl rollout status deployment/perf-backend -n default --timeout=180s
+              kubectl get pods -n default -o wide
+              kubectl get svc perf-backend-svc -n default
+
+              if [ "$GATEWAY" = "envoy" ]; then
+                echo "=== Creating EnvoyProxy override for NodePort ==="
+                printf '%s\n' '{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"EnvoyProxy","metadata":{"name":"envoy-gateway-nodeport","namespace":"default"},"spec":{"provider":{"type":"Kubernetes","kubernetes":{"envoyService":{"patch":{"type":"StrategicMerge","value":{"spec":{"type":"NodePort"}}}}}}}}' > /tmp/envoyproxy-nodeport.json
+                cat /tmp/envoyproxy-nodeport.json
+                kubectl apply -f /tmp/envoyproxy-nodeport.json
+              fi
+
+              echo "=== Applying gateway config ==="
+              kubectl apply -f "${BASE}/gateway.yaml"
+
+              if [ "$GATEWAY" = "envoy" ]; then
+                echo "=== Linking Gateway to EnvoyProxy NodePort config ==="
+                kubectl -n default patch gateway envoy-gateway --type merge -p '{"spec":{"infrastructure":{"parametersRef":{"group":"gateway.envoyproxy.io","kind":"EnvoyProxy","name":"envoy-gateway-nodeport"}}}}'
+              fi
+            else
+              echo "Skipping deployment"
+            fi
+
+            echo "=== Waiting for Gateway Listener Programmed ==="
+            READY="false"
+            for i in $(seq 1 24); do
+              STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
+                -o jsonpath='{range .status.listeners[*].conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null \
+                | grep 'Programmed=True' || true)
+
+              echo "Attempt $i: ${STATUS:-NotReady}"
+
+              if [[ "$STATUS" == *"Programmed=True"* ]]; then
+                READY="true"
+                echo "Gateway is ready (listener programmed)"
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ "$READY" != "true" ]; then
+              echo "Gateway did not become ready"
+              kubectl get gateway -A || true
+              kubectl describe gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" || true
+              exit 1
+            fi
+
+            echo "=== Gateway Resources ==="
+            kubectl get gateway -A || true
+            kubectl get httproute -A || true
+            kubectl get svc -A || true
+
+            echo "=== Finding generated service ==="
+            SERVICE_NAME=""
+            for i in $(seq 1 30); do
+              SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
+                -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+                | grep -E "$SERVICE_NAME_REGEX" | head -n1 || true)
+
+              if [ -n "${SERVICE_NAME:-}" ]; then
+                echo "Found service on attempt $i: $SERVICE_NAME"
+                break
+              fi
+
+              echo "Attempt $i: matching service not found yet"
+              kubectl get svc -n "$SERVICE_NAMESPACE" || true
+              sleep 5
+            done
+
+            if [ -z "${SERVICE_NAME:-}" ]; then
+              echo "No matching service found in namespace $SERVICE_NAMESPACE"
+              kubectl get svc -n "$SERVICE_NAMESPACE" || true
+              exit 1
+            fi
+
+            if [ "$GATEWAY" = "envoy" ]; then
+              echo "=== Waiting for Envoy service to become NodePort ==="
+              FINAL_TYPE=""
+              HTTP_PORT=""
+              HTTPS_PORT=""
+
+              for i in $(seq 1 30); do
+                FINAL_TYPE=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.type}')
+                HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
+                HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+
+                echo "Attempt $i: TYPE=$FINAL_TYPE HTTP_PORT=${HTTP_PORT:-<empty>} HTTPS_PORT=${HTTPS_PORT:-<empty>}"
+
+                if [ "$FINAL_TYPE" = "NodePort" ] && [ -n "${HTTP_PORT:-}" ]; then
+                  break
+                fi
+
+                sleep 5
+              done
+
+              if [ "${FINAL_TYPE:-}" != "NodePort" ]; then
+                echo "Envoy service is still not NodePort"
+                kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+                kubectl get envoyproxy -A || true
+                kubectl get gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" -o yaml || true
+                exit 1
+              fi
+            fi
+
+            NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+            echo "NODE_IP=$NODE_IP"
+            echo "SERVICE_NAME=$SERVICE_NAME"
+
+            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
+            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+
+            echo "HTTP_PORT=${HTTP_PORT:-<empty>}"
+            echo "HTTPS_PORT=${HTTPS_PORT:-<empty>}"
+            echo "HOST_HEADER=$HOST_HEADER"
+
+            if [ -z "${HTTP_PORT:-}" ]; then
+              echo "HTTP NodePort not found"
+              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+              exit 1
+            fi
+
+            echo "=== Waiting for HTTP NodePort to accept connections ==="
+            HTTP_READY="false"
+            for i in $(seq 1 30); do
+              if curl -sS -o /dev/null --max-time 5 \
+                -H "Host: $HOST_HEADER" \
+                "http://$NODE_IP:$HTTP_PORT/"; then
+                HTTP_READY="true"
+                echo "HTTP NodePort is reachable on attempt $i"
+                break
+              fi
+
+              echo "Attempt $i: HTTP NodePort not reachable yet"
+              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" || true
+              kubectl get pods -n envoy-gateway-system -o wide || true
+              sleep 5
+            done
+
+            if [ "$HTTP_READY" != "true" ]; then
+              echo "HTTP NodePort never became reachable"
+              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+              kubectl get pods -n envoy-gateway-system -o wide || true
+              exit 1
+            fi
+
+            echo "=== HTTP CURL TEST ==="
+            curl -vk --fail-with-body --max-time 15 \
+              -H "Host: $HOST_HEADER" \
+              "http://$NODE_IP:$HTTP_PORT/"
+
+            if [ -n "${HTTPS_PORT:-}" ]; then
+              echo "=== Waiting for HTTPS NodePort to accept connections ==="
+              HTTPS_READY="false"
+              for i in $(seq 1 30); do
+                if curl -ksS -o /dev/null --max-time 5 \
+                  --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
+                  "https://$HOST_HEADER:$HTTPS_PORT/"; then
+                  HTTPS_READY="true"
+                  echo "HTTPS NodePort is reachable on attempt $i"
+                  break
+                fi
+
+                echo "Attempt $i: HTTPS NodePort not reachable yet"
+                kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" || true
+                kubectl get pods -n envoy-gateway-system -o wide || true
+                sleep 5
+              done
+
+              if [ "$HTTPS_READY" != "true" ]; then
+                echo "HTTPS NodePort never became reachable"
+                kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+                kubectl get pods -n envoy-gateway-system -o wide || true
+                exit 1
+              fi
+
+              echo "=== HTTPS CURL TEST ==="
+              curl -vk --fail-with-body --max-time 15 \
+                --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
+                "https://$HOST_HEADER:$HTTPS_PORT/"
+            else
+              echo "HTTPS NodePort not present, skipping HTTPS curl check"
+            fi
+
+            echo "=== Deployment and curl validation completed successfully ==="
