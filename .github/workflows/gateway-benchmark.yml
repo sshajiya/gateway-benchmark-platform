@@ -25,7 +25,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
@@ -91,9 +92,8 @@ jobs:
 
               if [ "$GATEWAY" = "envoy" ]; then
                 echo "=== Creating EnvoyProxy override for NodePort ==="
-                cat >/tmp/envoyproxy-nodeport.json <<'EOF'
-{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"EnvoyProxy","metadata":{"name":"envoy-gateway-nodeport","namespace":"default"},"spec":{"provider":{"type":"Kubernetes","kubernetes":{"envoyService":{"patch":{"type":"StrategicMerge","value":{"spec":{"type":"NodePort"}}}}}}}}
-EOF
+                printf '%s\n' '{"apiVersion":"gateway.envoyproxy.io/v1alpha1","kind":"EnvoyProxy","metadata":{"name":"envoy-gateway-nodeport","namespace":"default"},"spec":{"provider":{"type":"Kubernetes","kubernetes":{"envoyService":{"patch":{"type":"StrategicMerge","value":{"spec":{"type":"NodePort"}}}}}}}}' > /tmp/envoyproxy-nodeport.json
+                cat /tmp/envoyproxy-nodeport.json
                 kubectl apply -f /tmp/envoyproxy-nodeport.json
               fi
 
@@ -169,10 +169,8 @@ EOF
 
               for i in $(seq 1 30); do
                 FINAL_TYPE=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.type}')
-                HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-                  -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-                HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-                  -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+                HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
+                HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
 
                 echo "Attempt $i: TYPE=$FINAL_TYPE HTTP_PORT=${HTTP_PORT:-<empty>} HTTPS_PORT=${HTTPS_PORT:-<empty>}"
 
@@ -196,10 +194,8 @@ EOF
             echo "NODE_IP=$NODE_IP"
             echo "SERVICE_NAME=$SERVICE_NAME"
 
-            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-              -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-              -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
+            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
 
             echo "HTTP_PORT=${HTTP_PORT:-<empty>}"
             echo "HTTPS_PORT=${HTTPS_PORT:-<empty>}"
