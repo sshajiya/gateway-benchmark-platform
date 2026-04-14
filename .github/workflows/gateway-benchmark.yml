@@ -67,8 +67,8 @@ jobs:
             BASE="/tmp/gateway-benchmark/scripts/deploy/${GATEWAY}"
             COMMON="/tmp/gateway-benchmark/scripts/deploy/common"
 
-            chmod +x "${COMMON}/cleanup_gateway.sh"
-            chmod +x "${BASE}/install.sh"
+            [ -f "${COMMON}/cleanup_gateway.sh" ] && chmod +x "${COMMON}/cleanup_gateway.sh"
+            [ -f "${BASE}/install.sh" ] && chmod +x "${BASE}/install.sh"
 
             # ✅ SAFE metadata loading
             if [ -f "${BASE}/metadata.env" ]; then
