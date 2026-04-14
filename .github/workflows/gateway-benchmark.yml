@@ -207,12 +207,60 @@ jobs:
               exit 1
             fi
 
+            echo "=== Waiting for HTTP NodePort to accept connections ==="
+            HTTP_READY="false"
+            for i in $(seq 1 30); do
+              if curl -sS -o /dev/null --max-time 5 \
+                -H "Host: $HOST_HEADER" \
+                "http://$NODE_IP:$HTTP_PORT/"; then
+                HTTP_READY="true"
+                echo "HTTP NodePort is reachable on attempt $i"
+                break
+              fi
+
+              echo "Attempt $i: HTTP NodePort not reachable yet"
+              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" || true
+              kubectl get pods -n envoy-gateway-system -o wide || true
+              sleep 5
+            done
+
+            if [ "$HTTP_READY" != "true" ]; then
+              echo "HTTP NodePort never became reachable"
+              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+              kubectl get pods -n envoy-gateway-system -o wide || true
+              exit 1
+            fi
+
             echo "=== HTTP CURL TEST ==="
             curl -vk --fail-with-body --max-time 15 \
               -H "Host: $HOST_HEADER" \
               "http://$NODE_IP:$HTTP_PORT/"
 
             if [ -n "${HTTPS_PORT:-}" ]; then
+              echo "=== Waiting for HTTPS NodePort to accept connections ==="
+              HTTPS_READY="false"
+              for i in $(seq 1 30); do
+                if curl -ksS -o /dev/null --max-time 5 \
+                  --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
+                  "https://$HOST_HEADER:$HTTPS_PORT/"; then
+                  HTTPS_READY="true"
+                  echo "HTTPS NodePort is reachable on attempt $i"
+                  break
+                fi
+
+                echo "Attempt $i: HTTPS NodePort not reachable yet"
+                kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" || true
+                kubectl get pods -n envoy-gateway-system -o wide || true
+                sleep 5
+              done
+
+              if [ "$HTTPS_READY" != "true" ]; then
+                echo "HTTPS NodePort never became reachable"
+                kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+                kubectl get pods -n envoy-gateway-system -o wide || true
+                exit 1
+              fi
+
               echo "=== HTTPS CURL TEST ==="
               curl -vk --fail-with-body --max-time 15 \
                 --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
