@@ -91,23 +91,23 @@ jobs:
 
               if [ "$GATEWAY" = "envoy" ]; then
                 echo "=== Creating EnvoyProxy override for NodePort ==="
-                cat <<EOF | kubectl apply -f -
-                apiVersion: gateway.envoyproxy.io/v1alpha1
-                kind: EnvoyProxy
-                metadata:
-                  name: ${GATEWAY_NAME}-nodeport
-                  namespace: ${GATEWAY_NAMESPACE}
-                spec:
-                  provider:
-                    type: Kubernetes
-                    kubernetes:
-                      envoyService:
-                        patch:
-                          type: StrategicMerge
-                          value:
-                            spec:
-                              type: NodePort
-                EOF
+                cat <<'EOF' | kubectl apply -f -
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: envoy-gateway-nodeport
+  namespace: default
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              type: NodePort
+EOF
               fi
 
               echo "=== Applying gateway config ==="
@@ -115,8 +115,18 @@ jobs:
 
               if [ "$GATEWAY" = "envoy" ]; then
                 echo "=== Linking Gateway to EnvoyProxy NodePort config ==="
-                kubectl -n "$GATEWAY_NAMESPACE" patch gateway "$GATEWAY_NAME" --type merge -p \
-                  "{\"spec\":{\"infrastructure\":{\"parametersRef\":{\"group\":\"gateway.envoyproxy.io\",\"kind\":\"EnvoyProxy\",\"name\":\"${GATEWAY_NAME}-nodeport\"}}}}"
+                kubectl -n default patch gateway envoy-gateway --type merge -p '
+                {
+                  "spec": {
+                    "infrastructure": {
+                      "parametersRef": {
+                        "group": "gateway.envoyproxy.io",
+                        "kind": "EnvoyProxy",
+                        "name": "envoy-gateway-nodeport"
+                      }
+                    }
+                  }
+                }'
               fi
             else
               echo "Skipping deployment"
