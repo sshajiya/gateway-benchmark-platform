@@ -142,10 +142,10 @@ jobs:
             fi
 
             HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-              -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-
+              -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}' 2>/dev/null || true)
+            
             HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-              -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+              -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}' 2>/dev/null || true)
 
             READY_FOR_BENCHMARK=false
 
