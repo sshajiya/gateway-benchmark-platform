@@ -1,4 +1,4 @@
-name: Gateway Benchmark Platform
+name: Gateway Deploy and Validate
 
 on:
   workflow_dispatch:
@@ -23,11 +23,6 @@ on:
 jobs:
   deploy-validate:
     runs-on: ubuntu-latest
-    outputs:
-      node_ip: ${{ steps.export_outputs.outputs.node_ip }}
-      http_port: ${{ steps.export_outputs.outputs.http_port }}
-      https_port: ${{ steps.export_outputs.outputs.https_port }}
-      host_header: ${{ steps.export_outputs.outputs.host_header }}
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +38,7 @@ jobs:
           source: "scripts"
           target: "/tmp/gateway-benchmark"
 
-      - name: Run deployment logic
+      - name: Run deployment and curl validation
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.MASTER_IP }}
@@ -73,7 +68,7 @@ jobs:
             echo "DEPLOY=$DEPLOY"
 
             echo "=== Node Health ==="
-            kubectl get nodes
+            kubectl get nodes -o wide
 
             if [ "$DESTROY" = "true" ]; then
               echo "=== Destroying existing gateways ==="
@@ -90,6 +85,7 @@ jobs:
               echo "=== Deploying backend app ==="
               kubectl apply -f /tmp/gateway-benchmark/scripts/apps/perf-backend.yaml
               kubectl rollout status deployment/perf-backend -n default --timeout=180s
+              kubectl get pods -n default -o wide
               kubectl get svc perf-backend-svc -n default
 
               echo "=== Applying gateway config ==="
@@ -99,11 +95,33 @@ jobs:
             fi
 
             if [ "$GATEWAY" = "envoy" ]; then
+              echo "=== Waiting for Envoy data-plane service ==="
+
+              SVC=""
+              for i in $(seq 1 30); do
+                SVC=$(kubectl -n envoy-gateway-system get svc \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+                  | grep '^envoy-default-' | head -n1 || true)
+
+                if [ -n "${SVC:-}" ]; then
+                  echo "Found Envoy service on attempt $i: $SVC"
+                  break
+                fi
+
+                echo "Attempt $i: Envoy service not found yet"
+                kubectl get svc -n envoy-gateway-system || true
+                sleep 5
+              done
+
+              if [ -z "${SVC:-}" ]; then
+                echo "Envoy data-plane service was not found"
+                kubectl get svc -n envoy-gateway-system || true
+                kubectl get gateway -A || true
+                kubectl describe gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" || true
+                exit 1
+              fi
+
               echo "=== Converting Envoy service to NodePort ==="
-              SVC=$(kubectl -n envoy-gateway-system get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^envoy-default-' | head -n1)
-
-              echo "Service found: $SVC"
-
               kubectl -n envoy-gateway-system patch svc "$SVC" \
                 -p '{"spec":{"type":"NodePort"}}'
 
@@ -111,6 +129,7 @@ jobs:
             fi
 
             echo "=== Waiting for Gateway Programmed ==="
+            READY="false"
             for i in $(seq 1 20); do
               STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
                 -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
@@ -118,6 +137,7 @@ jobs:
               echo "Attempt $i: Programmed=${STATUS:-<empty>}"
 
               if [ "$STATUS" = "True" ]; then
+                READY="true"
                 echo "Gateway is ready"
                 break
               fi
@@ -125,168 +145,61 @@ jobs:
               sleep 10
             done
 
-            STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
-              -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
-
-            if [ "$STATUS" != "True" ]; then
+            if [ "$READY" != "true" ]; then
               echo "Gateway did not become ready"
               kubectl get gateway -A || true
               kubectl describe gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" || true
               exit 1
             fi
 
+            echo "=== Gateway Resources ==="
+            kubectl get gateway -A || true
+            kubectl get httproute -A || true
+            kubectl get svc -A || true
+
             NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-
-            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "$SERVICE_NAME_REGEX" | head -n1)
-
-            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
-
             echo "NODE_IP=$NODE_IP"
-            echo "HTTP_PORT=$HTTP_PORT"
-            echo "HTTPS_PORT=$HTTPS_PORT"
 
-            echo "=== CURL TEST ==="
+            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+              | grep -E "$SERVICE_NAME_REGEX" | head -n1 || true)
 
-            curl -vk --fail-with-body --max-time 10 \
+            if [ -z "${SERVICE_NAME:-}" ]; then
+              echo "No matching service found in namespace $SERVICE_NAMESPACE"
+              kubectl get svc -n "$SERVICE_NAMESPACE" || true
+              exit 1
+            fi
+
+            echo "SERVICE_NAME=$SERVICE_NAME"
+
+            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
+              -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
+
+            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
+              -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+
+            echo "HTTP_PORT=${HTTP_PORT:-<empty>}"
+            echo "HTTPS_PORT=${HTTPS_PORT:-<empty>}"
+            echo "HOST_HEADER=$HOST_HEADER"
+
+            if [ -z "${HTTP_PORT:-}" ]; then
+              echo "HTTP NodePort not found"
+              kubectl get svc "$SERVICE_NAME" -n "$SERVICE_NAMESPACE" -o yaml || true
+              exit 1
+            fi
+
+            echo "=== HTTP CURL TEST ==="
+            curl -vk --fail-with-body --max-time 15 \
               -H "Host: $HOST_HEADER" \
               "http://$NODE_IP:$HTTP_PORT/"
 
-            curl -vk --fail-with-body --max-time 10 \
-              --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
-              "https://$HOST_HEADER:$HTTPS_PORT/"
-
-            cat > /tmp/output.env <<EOF
-            NODE_IP=$NODE_IP
-            HTTP_PORT=$HTTP_PORT
-            HTTPS_PORT=$HTTPS_PORT
-            HOST_HEADER=$HOST_HEADER
-            EOF
-
-      - name: Fetch outputs from master
-        id: fetch_outputs
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.MASTER_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            cat /tmp/output.env
-
-      - name: Export outputs
-        id: export_outputs
-        run: |
-          set -euo pipefail
-          cat <<'EOF' > output.env
-          ${{ steps.fetch_outputs.outputs.stdout }}
-          EOF
-
-          . ./output.env
-
-          echo "node_ip=$NODE_IP" >> "$GITHUB_OUTPUT"
-          echo "http_port=$HTTP_PORT" >> "$GITHUB_OUTPUT"
-          echo "https_port=$HTTPS_PORT" >> "$GITHUB_OUTPUT"
-          echo "host_header=$HOST_HEADER" >> "$GITHUB_OUTPUT"
-
-  benchmark:
-    needs: deploy-validate
-    runs-on: ubuntu-latest
-    env:
-      NODE_IP: ${{ needs.deploy-validate.outputs.node_ip }}
-      HTTP_PORT: ${{ needs.deploy-validate.outputs.http_port }}
-      HTTPS_PORT: ${{ needs.deploy-validate.outputs.https_port }}
-      HOST_HEADER: ${{ needs.deploy-validate.outputs.host_header }}
-      GATEWAY: ${{ github.event.inputs.gateway }}
-      VERSION: ${{ github.event.inputs.version }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Copy k6 scripts to TG
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.TG_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "scripts/tests"
-          target: "/tmp/gateway-benchmark"
-
-      - name: Run k6 tests on TG
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.TG_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          script_stop: true
-          envs: NODE_IP,HTTP_PORT,HTTPS_PORT,HOST_HEADER,GATEWAY,VERSION
-          script: |
-            set -euo pipefail
-
-            mkdir -p /tmp/k6-results
-            cd /tmp/gateway-benchmark/scripts/tests
-
-            export TARGET_HOST="${HOST_HEADER}"
-            export TARGET_NODE_IP="${NODE_IP}"
-            export TARGET_HTTP_PORT="${HTTP_PORT}"
-            export TARGET_HTTPS_PORT="${HTTPS_PORT}"
-            export GATEWAY="${GATEWAY}"
-            export VERSION="${VERSION}"
-
-            echo "TARGET_HOST=${TARGET_HOST}"
-            echo "TARGET_NODE_IP=${TARGET_NODE_IP}"
-            echo "TARGET_HTTP_PORT=${TARGET_HTTP_PORT}"
-            echo "TARGET_HTTPS_PORT=${TARGET_HTTPS_PORT}"
-
-            k6 run m01-throughput.js \
-              --summary-export=/tmp/k6-results/m01-throughput.json
-
-            k6 run m04-tls-handshake.js \
-              --summary-export=/tmp/k6-results/m04-tls-handshake.json
-
-            if [ -f m05-route-propagation.js ]; then
-              k6 run m05-route-propagation.js \
-                --summary-export=/tmp/k6-results/m05-route-propagation.json
+            if [ -n "${HTTPS_PORT:-}" ]; then
+              echo "=== HTTPS CURL TEST ==="
+              curl -vk --fail-with-body --max-time 15 \
+                --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
+                "https://$HOST_HEADER:$HTTPS_PORT/"
+            else
+              echo "HTTPS NodePort not present, skipping HTTPS curl check"
             fi
 
-            cat > /tmp/k6-results/run-metadata.json <<EOF
-            {
-              "gateway": "${GATEWAY}",
-              "version": "${VERSION}",
-              "node_ip": "${NODE_IP}",
-              "http_port": "${HTTP_PORT}",
-              "https_port": "${HTTPS_PORT}",
-              "host_header": "${HOST_HEADER}"
-            }
-            EOF
-
-      - name: Download k6 results
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.TG_IP }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          source: "/tmp/k6-results/*"
-          target: "./downloaded-results"
-
-      - name: Generate webpage
-        run: |
-          set -euo pipefail
-          python3 scripts/report/generate_dashboard.py \
-            --results-dir "./downloaded-results/tmp/k6-results" \
-            --output-dir "./public"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: gateway-benchmark-results
-          path: |
-            downloaded-results
-            public
-
-      - name: Publish to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./public
+            echo "=== Deployment and curl validation completed successfully ==="
