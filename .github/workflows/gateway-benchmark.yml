@@ -19,6 +19,10 @@ on:
         description: "Deploy gateway? (true/false)"
         required: true
         default: "true"
+      benchmark:
+        description: "Run benchmark? (true/false)"
+        required: true
+        default: "true"
 
 jobs:
   deploy-validate:
@@ -28,6 +32,7 @@ jobs:
       http_port: ${{ steps.export_outputs.outputs.http_port }}
       https_port: ${{ steps.export_outputs.outputs.https_port }}
       host_header: ${{ steps.export_outputs.outputs.host_header }}
+      ready_for_benchmark: ${{ steps.export_outputs.outputs.ready_for_benchmark }}
 
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +62,7 @@ jobs:
             VERSION="${{ github.event.inputs.version }}"
             DESTROY="${{ github.event.inputs.destroy }}"
             DEPLOY="${{ github.event.inputs.deploy }}"
+            BENCHMARK="${{ github.event.inputs.benchmark }}"
 
             BASE="/tmp/gateway-benchmark/scripts/deploy/${GATEWAY}"
             COMMON="/tmp/gateway-benchmark/scripts/deploy/common"
@@ -71,6 +77,7 @@ jobs:
             echo "VERSION=$VERSION"
             echo "DESTROY=$DESTROY"
             echo "DEPLOY=$DEPLOY"
+            echo "BENCHMARK=$BENCHMARK"
 
             echo "=== Node Health ==="
             kubectl get nodes
@@ -81,6 +88,18 @@ jobs:
               kubectl delete httproute --all -A --ignore-not-found || true
               kubectl delete gatewayclass --all --ignore-not-found || true
               "${COMMON}/cleanup_gateway.sh" "$GATEWAY" || true
+            fi
+
+            # destroy=true + deploy=false => destroy only, skip benchmark
+            if [ "$DESTROY" = "true" ] && [ "$DEPLOY" = "false" ]; then
+              cat > /tmp/output.env <<EOF
+            READY_FOR_BENCHMARK=false
+            NODE_IP=
+            HTTP_PORT=
+            HTTPS_PORT=
+            HOST_HEADER=$HOST_HEADER
+            EOF
+              exit 0
             fi
 
             if [ "$DEPLOY" = "true" ]; then
@@ -95,19 +114,20 @@ jobs:
               echo "=== Applying gateway config ==="
               kubectl apply -f "${BASE}/gateway.yaml"
             else
-              echo "Skipping deployment"
+              echo "=== Reusing existing deployment ==="
             fi
 
             if [ "$GATEWAY" = "envoy" ]; then
               echo "=== Converting Envoy service to NodePort ==="
-              SVC=$(kubectl -n envoy-gateway-system get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^envoy-default-' | head -n1)
+              SVC=$(kubectl -n envoy-gateway-system get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^envoy-default-' | head -n1 || true)
 
-              echo "Service found: $SVC"
+              if [ -n "$SVC" ]; then
+                echo "Service found: $SVC"
+                kubectl -n envoy-gateway-system patch svc "$SVC" \
+                  -p '{"spec":{"type":"NodePort"}}' || true
+              fi
 
-              kubectl -n envoy-gateway-system patch svc "$SVC" \
-                -p '{"spec":{"type":"NodePort"}}'
-
-              kubectl get svc -n envoy-gateway-system
+              kubectl get svc -n envoy-gateway-system || true
             fi
 
             echo "=== Waiting for Gateway Programmed ==="
@@ -122,14 +142,19 @@ jobs:
                 break
               fi
 
+              # strict only when deploying
+              if [ "$DEPLOY" = "false" ]; then
+                break
+              fi
+
               sleep 10
             done
 
             STATUS=$(kubectl -n "$GATEWAY_NAMESPACE" get gateway "$GATEWAY_NAME" \
               -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)
 
-            if [ "$STATUS" != "True" ]; then
-              echo "Gateway did not become ready"
+            if [ "$DEPLOY" = "true" ] && [ "$STATUS" != "True" ]; then
+              echo "Gateway did not become ready after deployment"
               kubectl get gateway -A || true
               kubectl describe gateway "$GATEWAY_NAME" -n "$GATEWAY_NAMESPACE" || true
               exit 1
@@ -137,26 +162,57 @@ jobs:
 
             NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
-            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "$SERVICE_NAME_REGEX" | head -n1)
+            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -E "$SERVICE_NAME_REGEX" | head -n1 || true)
 
-            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}')
-            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}')
+            if [ -z "$SERVICE_NAME" ]; then
+              echo "No matching service found"
+              cat > /tmp/output.env <<EOF
+            READY_FOR_BENCHMARK=false
+            NODE_IP=
+            HTTP_PORT=
+            HTTPS_PORT=
+            HOST_HEADER=$HOST_HEADER
+            EOF
+              exit 0
+            fi
+
+            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==80)].nodePort}' 2>/dev/null || true)
+            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath='{.spec.ports[?(@.port==443)].nodePort}' 2>/dev/null || true)
 
             echo "NODE_IP=$NODE_IP"
             echo "HTTP_PORT=$HTTP_PORT"
             echo "HTTPS_PORT=$HTTPS_PORT"
 
-            echo "=== CURL TEST ==="
+            READY_FOR_BENCHMARK=false
 
-            curl -vk --fail-with-body --max-time 10 \
-              -H "Host: $HOST_HEADER" \
-              "http://$NODE_IP:$HTTP_PORT/"
+            if [ "$BENCHMARK" = "true" ]; then
+              echo "=== CURL TEST ==="
 
-            curl -vk --fail-with-body --max-time 10 \
-              --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
-              "https://$HOST_HEADER:$HTTPS_PORT/"
+              HTTP_OK=false
+              HTTPS_OK=false
+
+              if curl -vk --fail-with-body --max-time 10 \
+                -H "Host: $HOST_HEADER" \
+                "http://$NODE_IP:$HTTP_PORT/"; then
+                HTTP_OK=true
+              fi
+
+              if curl -vk --fail-with-body --max-time 10 \
+                --resolve "$HOST_HEADER:$HTTPS_PORT:$NODE_IP" \
+                "https://$HOST_HEADER:$HTTPS_PORT/"; then
+                HTTPS_OK=true
+              fi
+
+              echo "HTTP_OK=$HTTP_OK"
+              echo "HTTPS_OK=$HTTPS_OK"
+
+              if [ "$HTTP_OK" = "true" ] && [ "$HTTPS_OK" = "true" ]; then
+                READY_FOR_BENCHMARK=true
+              fi
+            fi
 
             cat > /tmp/output.env <<EOF
+            READY_FOR_BENCHMARK=$READY_FOR_BENCHMARK
             NODE_IP=$NODE_IP
             HTTP_PORT=$HTTP_PORT
             HTTPS_PORT=$HTTPS_PORT
@@ -183,13 +239,15 @@ jobs:
 
           . ./output.env
 
-          echo "node_ip=$NODE_IP" >> "$GITHUB_OUTPUT"
-          echo "http_port=$HTTP_PORT" >> "$GITHUB_OUTPUT"
-          echo "https_port=$HTTPS_PORT" >> "$GITHUB_OUTPUT"
-          echo "host_header=$HOST_HEADER" >> "$GITHUB_OUTPUT"
+          echo "node_ip=${NODE_IP}" >> "$GITHUB_OUTPUT"
+          echo "http_port=${HTTP_PORT}" >> "$GITHUB_OUTPUT"
+          echo "https_port=${HTTPS_PORT}" >> "$GITHUB_OUTPUT"
+          echo "host_header=${HOST_HEADER}" >> "$GITHUB_OUTPUT"
+          echo "ready_for_benchmark=${READY_FOR_BENCHMARK}" >> "$GITHUB_OUTPUT"
 
   benchmark:
     needs: deploy-validate
+    if: ${{ github.event.inputs.benchmark == 'true' && needs.deploy-validate.outputs.ready_for_benchmark == 'true' }}
     runs-on: ubuntu-latest
     env:
       NODE_IP: ${{ needs.deploy-validate.outputs.node_ip }}
