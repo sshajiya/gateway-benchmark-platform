@@ -40,10 +40,18 @@ jobs:
               -o jsonpath="{range .items[*]}{.metadata.name}{\"\n\"}{end}" \
               | grep -E "$SERVICE_NAME_REGEX" | head -n1)
 
-            NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[?(@.type==\"InternalIP\")].address}")
-            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath="{.spec.ports[?(@.port==80)].nodePort}")
-            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" -o jsonpath="{.spec.ports[?(@.port==443)].nodePort}")
+            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
+              -o jsonpath="{.spec.ports[?(@.port==80)].nodePort}")
 
+            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
+              -o jsonpath="{.spec.ports[?(@.port==443)].nodePort}")
+
+            POD_NODE=$(kubectl get pods -n default -l app=perf-backend \
+              -o jsonpath='{.items[0].spec.nodeName}')
+
+            NODE_IP=$(kubectl get node "$POD_NODE" \
+              -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+            
             echo "NODE_IP=$NODE_IP"
             echo "HTTP_PORT=$HTTP_PORT"
             echo "HTTPS_PORT=$HTTPS_PORT"
