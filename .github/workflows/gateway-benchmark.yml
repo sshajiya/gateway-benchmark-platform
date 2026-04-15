@@ -1,160 +1,94 @@
-name: Gateway Benchmark
+name: Run k6 remotely and generate webpage
 
 on:
   workflow_dispatch:
     inputs:
-      gateway:
-        description: "envoy | ngf | cilium"
+      script_name:
+        description: "k6 script file name already present on TG"
         required: true
-        default: "envoy"
-      version:
-        description: "gateway version"
+        default: "m01-throughput.js"
+      script_dir:
+        description: "Directory on TG containing k6 and python scripts"
         required: true
-        default: "v1.7.1"
+        default: "/home/sh.shaik/envoy-benchmark-tests"
+      python_script:
+        description: "Python script name already present on TG"
+        required: true
+        default: "generate_report.py"
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Prepare SSH key
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          printf '%s\n' '${{ secrets.SSH_KEY }}' > ~/.ssh/id_rsa
+          printf '%s\n' "${{ secrets.TG_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.TG_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Discover target from master
+      - name: Run k6 and generate webpage on TG
+        shell: bash
         run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "${{ secrets.USERNAME }}@${{ secrets.MASTER_IP }}" '
-            set -eo pipefail
+          set -euo pipefail
 
-            GATEWAY="${{ github.event.inputs.gateway }}"
-            BASE="/tmp/gateway-benchmark/scripts/deploy/${GATEWAY}"
+          ssh -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}" <<EOF
+            set -euo pipefail
 
-            . "${BASE}/metadata.env"
+            SCRIPT_DIR='${{ github.event.inputs.script_dir }}'
+            SCRIPT_NAME='${{ github.event.inputs.script_name }}'
+            PYTHON_SCRIPT='${{ github.event.inputs.python_script }}'
 
-            SERVICE_NAME=$(kubectl -n "$SERVICE_NAMESPACE" get svc \
-              -o jsonpath="{range .items[*]}{.metadata.name}{\"\n\"}{end}" \
-              | grep -E "$SERVICE_NAME_REGEX" | head -n1)
+            cd "\$SCRIPT_DIR"
 
-            HTTP_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-              -o jsonpath="{.spec.ports[?(@.port==80)].nodePort}")
+            echo "Working directory: \$(pwd)"
+            echo "Checking files..."
+            ls -1
 
-            HTTPS_PORT=$(kubectl -n "$SERVICE_NAMESPACE" get svc "$SERVICE_NAME" \
-              -o jsonpath="{.spec.ports[?(@.port==443)].nodePort}")
+            command -v k6 >/dev/null 2>&1 || { echo "k6 is not installed"; exit 1; }
+            command -v python3 >/dev/null 2>&1 || { echo "python3 is not installed"; exit 1; }
 
-            POD_NODE=$(kubectl get pods -n default -l app=perf-backend \
-              -o jsonpath='{.items[0].spec.nodeName}')
+            [ -f "\$SCRIPT_NAME" ] || { echo "Missing k6 script: \$SCRIPT_NAME"; exit 1; }
+            [ -f "\$PYTHON_SCRIPT" ] || { echo "Missing python script: \$PYTHON_SCRIPT"; exit 1; }
 
-            NODE_IP=$(kubectl get node "$POD_NODE" \
-              -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
-            
-            echo "NODE_IP=$NODE_IP"
-            echo "HTTP_PORT=$HTTP_PORT"
-            echo "HTTPS_PORT=$HTTPS_PORT"
-            echo "HOST_HEADER=$HOST_HEADER"
-            echo "GATEWAY=${{ github.event.inputs.gateway }}"
-            echo "VERSION=${{ github.event.inputs.version }}"
-          ' > benchmark-target.env
+            mkdir -p results logs public
 
-          cat benchmark-target.env
+            TS=\$(date +%Y%m%d-%H%M%S)
+            BASE_NAME="\${SCRIPT_NAME%.js}"
+            JSON_OUT="results/\${TS}-\${BASE_NAME}.json"
+            LOG_OUT="logs/\${TS}-\${BASE_NAME}.log"
+            HTML_OUT="public/index.html"
 
-          . ./benchmark-target.env
+            echo "Running k6 script: \$SCRIPT_NAME"
+            k6 run "\$SCRIPT_NAME" --summary-export "\$JSON_OUT" | tee "\$LOG_OUT"
 
-          echo "NODE_IP=$NODE_IP" >> "$GITHUB_ENV"
-          echo "HTTP_PORT=$HTTP_PORT" >> "$GITHUB_ENV"
-          echo "HTTPS_PORT=$HTTPS_PORT" >> "$GITHUB_ENV"
-          echo "HOST_HEADER=$HOST_HEADER" >> "$GITHUB_ENV"
-          echo "GATEWAY=$GATEWAY" >> "$GITHUB_ENV"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+            echo "Generating webpage using: \$PYTHON_SCRIPT"
+            python3 "\$PYTHON_SCRIPT" --input "\$JSON_OUT" --output "\$HTML_OUT"
 
-      - name: Copy test scripts to traffic generator
+            echo "Completed successfully"
+            echo "JSON: \$JSON_OUT"
+            echo "LOG : \$LOG_OUT"
+            echo "HTML: \$HTML_OUT"
+          EOF
+
+      - name: Copy webpage and artifacts from TG
+        shell: bash
         run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}" 'mkdir -p /tmp/gateway-benchmark'
-          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -r \
-            scripts/tests \
-            "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}:/tmp/gateway-benchmark/"
+          set -euo pipefail
+          mkdir -p site results logs
 
-      - name: Run k6 tests on traffic generator
-        run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}" "
-            set -eo pipefail
-            mkdir -p /tmp/k6-results
-            rm -f /tmp/k6-results/*.json || true
-            cd /tmp/gateway-benchmark/tests
-
-            export TARGET_NODE_IP='${NODE_IP}'
-            export TARGET_HTTP_PORT='${HTTP_PORT}'
-            export TARGET_HTTPS_PORT='${HTTPS_PORT}'
-            export TARGET_HOST='${HOST_HEADER}'
-            export GATEWAY='${GATEWAY}'
-            export VERSION='${VERSION}'
-
-            echo 'Running throughput test'
-            k6 run m01-throughput.js --summary-export=/tmp/k6-results/m01-throughput.json
-
-            if [ -f m04-tls-handshake.js ] && [ -n \"${TARGET_HTTPS_PORT}\" ]; then
-              echo 'Running TLS handshake test'
-              k6 run m04-tls-handshake.js --summary-export=/tmp/k6-results/m04-tls-handshake.json
-            fi
-
-            cat > /tmp/k6-results/run-metadata.json <<EOF
-            {
-              \"gateway\": \"${GATEWAY}\",
-              \"version\": \"${VERSION}\",
-              \"node_ip\": \"${TARGET_NODE_IP}\",
-              \"http_port\": \"${TARGET_HTTP_PORT}\",
-              \"https_port\": \"${TARGET_HTTPS_PORT}\",
-              \"host_header\": \"${TARGET_HOST}\"
-            }
-            EOF
-
-            ls -l /tmp/k6-results
-          "
-
-      - name: Download results from traffic generator
-        run: |
-          mkdir -p downloaded-results
-          scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -r \
-            "${{ secrets.USERNAME }}@${{ secrets.TG_IP }}:/tmp/k6-results" \
-            ./downloaded-results/
-
-      - name: Show downloaded files
-        run: |
-          find ./downloaded-results -type f | sort
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f scripts/report/requirements.txt ]; then
-            pip install -r scripts/report/requirements.txt
-          fi
-
-      - name: Generate webpage
-        run: |
-          mkdir -p public
-          python scripts/report/generate_dashboard.py \
-            --results-dir "./downloaded-results/k6-results" \
-            --output-dir "./public"
+          scp -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/public/index.html" site/index.html
+          scp -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/results/"*.json results/ || true
+          scp -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/logs/"*.log logs/ || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gateway-benchmark-results
+          name: benchmark-results
           path: |
-            downloaded-results
-            public
-
-      - name: Publish to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./public
+            site/index.html
+            results/
+            logs/
