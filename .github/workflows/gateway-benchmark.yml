@@ -1,4 +1,4 @@
-name: Run k6 remotely and generate webpage
+name: Benchmark Testing
 
 on:
   workflow_dispatch:
