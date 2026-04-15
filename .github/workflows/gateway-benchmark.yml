@@ -1,4 +1,4 @@
-name: Benchmark Testing
+name: Run k6 remotely and build webpage
 
 on:
   workflow_dispatch:
@@ -8,19 +8,21 @@ on:
         required: true
         default: "m01-throughput.js"
       script_dir:
-        description: "Directory on TG containing k6 and python scripts"
+        description: "Directory on TG containing k6 scripts"
         required: true
         default: "/home/sh.shaik/envoy-benchmark-tests"
-      python_script:
-        description: "Python script name already present on TG"
-        required: true
-        default: "generate_report.py"
+
+permissions:
+  contents: read
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Prepare SSH key
         shell: bash
         run: |
@@ -30,7 +32,7 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H "${{ secrets.TG_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Run k6 and generate webpage on TG
+      - name: Run k6 on traffic generator
         shell: bash
         run: |
           set -euo pipefail
@@ -40,54 +42,209 @@ jobs:
 
             SCRIPT_DIR='${{ github.event.inputs.script_dir }}'
             SCRIPT_NAME='${{ github.event.inputs.script_name }}'
-            PYTHON_SCRIPT='${{ github.event.inputs.python_script }}'
 
             cd "\$SCRIPT_DIR"
 
             echo "Working directory: \$(pwd)"
-            echo "Checking files..."
-            ls -1
-
             command -v k6 >/dev/null 2>&1 || { echo "k6 is not installed"; exit 1; }
-            command -v python3 >/dev/null 2>&1 || { echo "python3 is not installed"; exit 1; }
-
             [ -f "\$SCRIPT_NAME" ] || { echo "Missing k6 script: \$SCRIPT_NAME"; exit 1; }
-            [ -f "\$PYTHON_SCRIPT" ] || { echo "Missing python script: \$PYTHON_SCRIPT"; exit 1; }
 
-            mkdir -p results logs public
+            mkdir -p results logs
 
             TS=\$(date +%Y%m%d-%H%M%S)
             BASE_NAME="\${SCRIPT_NAME%.js}"
             JSON_OUT="results/\${TS}-\${BASE_NAME}.json"
             LOG_OUT="logs/\${TS}-\${BASE_NAME}.log"
-            HTML_OUT="public/index.html"
+            LATEST_JSON="results/latest-summary.json"
 
             echo "Running k6 script: \$SCRIPT_NAME"
             k6 run "\$SCRIPT_NAME" --summary-export "\$JSON_OUT" | tee "\$LOG_OUT"
 
-            echo "Generating webpage using: \$PYTHON_SCRIPT"
-            python3 "\$PYTHON_SCRIPT" --input "\$JSON_OUT" --output "\$HTML_OUT"
+            cp "\$JSON_OUT" "\$LATEST_JSON"
 
             echo "Completed successfully"
             echo "JSON: \$JSON_OUT"
             echo "LOG : \$LOG_OUT"
-            echo "HTML: \$HTML_OUT"
           EOF
 
-      - name: Copy webpage and artifacts from TG
+      - name: Copy result files from TG
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p site results logs
+          mkdir -p results logs site
 
-          scp -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/public/index.html" site/index.html
-          scp -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/results/"*.json results/ || true
-          scp -i ~/.ssh/id_rsa "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/logs/"*.log logs/ || true
+          scp -i ~/.ssh/id_rsa \
+            "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/results/latest-summary.json" \
+            results/latest-summary.json
+
+          scp -i ~/.ssh/id_rsa \
+            "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/results/"*.json \
+            results/ || true
+
+          scp -i ~/.ssh/id_rsa \
+            "${{ secrets.TG_USER }}@${{ secrets.TG_HOST }}:/home/sh.shaik/envoy-benchmark-tests/logs/"*.log \
+            logs/ || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate HTML webpage from k6 summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from html import escape
+
+          input_file = Path("results/latest-summary.json")
+          output_dir = Path("site")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          output_file = output_dir / "index.html"
+
+          if not input_file.exists():
+              raise SystemExit(f"Missing input file: {input_file}")
+
+          with input_file.open("r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          def get_metric(path, default="N/A"):
+              cur = data
+              for key in path:
+                  if isinstance(cur, dict) and key in cur:
+                      cur = cur[key]
+                  else:
+                      return default
+              return cur
+
+          def fmt_num(val, digits=2):
+              if isinstance(val, (int, float)):
+                  return f"{val:.{digits}f}"
+              return str(val)
+
+          metrics = {
+              "HTTP Requests": get_metric(["metrics", "http_reqs", "count"], "N/A"),
+              "Request Rate (/s)": get_metric(["metrics", "http_reqs", "rate"], "N/A"),
+              "Failed Request Rate": get_metric(["metrics", "http_req_failed", "rate"], "N/A"),
+              "Avg Latency (ms)": get_metric(["metrics", "http_req_duration", "values", "avg"], "N/A"),
+              "Median Latency (ms)": get_metric(["metrics", "http_req_duration", "values", "med"], "N/A"),
+              "P90 Latency (ms)": get_metric(["metrics", "http_req_duration", "values", "p(90)"], "N/A"),
+              "P95 Latency (ms)": get_metric(["metrics", "http_req_duration", "values", "p(95)"], "N/A"),
+              "P99 Latency (ms)": get_metric(["metrics", "http_req_duration", "values", "p(99)"], "N/A"),
+              "Iterations": get_metric(["metrics", "iterations", "count"], "N/A"),
+              "Dropped Iterations": get_metric(["metrics", "dropped_iterations", "count"], "N/A"),
+              "Data Received (bytes)": get_metric(["metrics", "data_received", "count"], "N/A"),
+              "Data Sent (bytes)": get_metric(["metrics", "data_sent", "count"], "N/A"),
+          }
+
+          rows = []
+          for key, value in metrics.items():
+              if isinstance(value, float):
+                  if "Rate" in key or "Latency" in key:
+                      value = fmt_num(value, 2)
+                  else:
+                      value = fmt_num(value, 0)
+              rows.append(
+                  f"<tr><td>{escape(str(key))}</td><td>{escape(str(value))}</td></tr>"
+              )
+
+          html = f"""<!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>k6 Benchmark Report</title>
+            <style>
+              body {{
+                font-family: Arial, sans-serif;
+                margin: 40px;
+                background: #f7f8fa;
+                color: #222;
+              }}
+              .container {{
+                max-width: 1000px;
+                margin: auto;
+                background: #fff;
+                padding: 24px 28px;
+                border-radius: 12px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+              }}
+              h1 {{
+                margin-top: 0;
+              }}
+              .meta {{
+                color: #555;
+                margin-bottom: 20px;
+              }}
+              table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 20px;
+              }}
+              th, td {{
+                text-align: left;
+                padding: 12px;
+                border-bottom: 1px solid #e5e7eb;
+              }}
+              th {{
+                background: #f0f2f5;
+              }}
+              .footer {{
+                margin-top: 24px;
+                font-size: 14px;
+                color: #666;
+              }}
+              pre {{
+                background: #0f172a;
+                color: #e2e8f0;
+                padding: 16px;
+                border-radius: 8px;
+                overflow-x: auto;
+              }}
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>k6 Benchmark Report</h1>
+              <div class="meta">
+                <strong>Script:</strong> {escape("${{ github.event.inputs.script_name }}")}<br>
+                <strong>Generated by:</strong> GitHub Actions
+              </div>
+
+              <table>
+                <thead>
+                  <tr>
+                    <th>Metric</th>
+                    <th>Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {''.join(rows)}
+                </tbody>
+              </table>
+
+              <div class="footer">
+                This page was generated automatically from the k6 summary JSON.
+              </div>
+
+              <h2>Raw Summary JSON</h2>
+              <pre>{escape(json.dumps(data, indent=2))}</pre>
+            </div>
+          </body>
+          </html>
+          """
+
+          output_file.write_text(html, encoding="utf-8")
+          print(f"Generated HTML report: {output_file}")
+          PY
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
+          name: benchmark-report
           path: |
             site/index.html
             results/
